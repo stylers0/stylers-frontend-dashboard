@@ -15,6 +15,8 @@ import {
   calculateMachineAnalytics,
   getDateRangeForFilter,
   formatDuration,
+  clipDataToShiftWindow,
+  getCurrentShiftBoundaries,
 } from "@/lib/analytics";
 import { MachineCard } from "@/components/MachineCard";
 import { StatsCard } from "@/components/StatsCard";
@@ -38,37 +40,28 @@ import {
 } from "@/components/ui/select";
 import LiveStatus from "./LiveStatus";
 
-// Helper function to sort machines by number (Machine_1, Machine_2, etc.)
-// Machines without numbers go to the end, sorted alphabetically
+// Helper: sort machines by number (Machine_1, Machine_2, …)
 function sortMachinesByNumber<T extends { machineName: string }>(
   machines: T[],
 ): T[] {
   return [...machines].sort((a, b) => {
     const numA = parseInt(a.machineName.replace(/\D/g, ""), 10);
     const numB = parseInt(b.machineName.replace(/\D/g, ""), 10);
-
-    // If both have numbers, sort by number
-    if (!isNaN(numA) && !isNaN(numB)) {
-      return numA - numB;
-    }
-    // If only one has a number, numbered ones come first
+    if (!isNaN(numA) && !isNaN(numB)) return numA - numB;
     if (!isNaN(numA)) return -1;
     if (!isNaN(numB)) return 1;
-    // If neither has a number, sort alphabetically
     return a.machineName.localeCompare(b.machineName);
   });
 }
 
-// Helper function to calculate counts from live status
-const calculateLiveStats = (liveStatus: LiveMachineStatus[]) => {
-  return {
-    RUNNING: liveStatus.filter((m) => m.status === "RUNNING").length,
-    DOWNTIME: liveStatus.filter((m) => m.status === "DOWNTIME").length,
-    OFF: liveStatus.filter((m) => m.status === "OFF").length,
-    UNKNOWN: liveStatus.filter((m) => m.status === "UNKNOWN").length,
-    total: liveStatus.length,
-  };
-};
+// Helper: calculate live status counts
+const calculateLiveStats = (liveStatus: LiveMachineStatus[]) => ({
+  RUNNING: liveStatus.filter((m) => m.status === "RUNNING").length,
+  DOWNTIME: liveStatus.filter((m) => m.status === "DOWNTIME").length,
+  OFF: liveStatus.filter((m) => m.status === "OFF").length,
+  UNKNOWN: liveStatus.filter((m) => m.status === "UNKNOWN").length,
+  total: liveStatus.length,
+});
 
 export default function Dashboard() {
   const [timeFilter, setTimeFilter] = useState<
@@ -90,7 +83,7 @@ export default function Dashboard() {
     "RUNNING" | "DOWNTIME" | "OFF" | null
   >(null);
 
-  // Fetch overview data
+  // ── Fetch overview ────────────────────────────────────────────────────────
   const {
     data: overviewData = [],
     refetch: refetchOverview,
@@ -103,7 +96,7 @@ export default function Dashboard() {
     staleTime: 10000,
   });
 
-  // Fetch stats
+  // ── Fetch stats ───────────────────────────────────────────────────────────
   const { data: statsData = {}, isLoading: isLoadingStats } =
     useQuery<DashboardStats>({
       queryKey: ["dashboard-stats"],
@@ -112,7 +105,7 @@ export default function Dashboard() {
       staleTime: 10000,
     });
 
-  // Function to fetch live status data
+  // ── Live status ───────────────────────────────────────────────────────────
   const fetchLiveData = async () => {
     try {
       setRefreshingLive(true);
@@ -125,19 +118,18 @@ export default function Dashboard() {
     }
   };
 
-  // Calculate live stats from live status data
-  const liveStats = useMemo(() => {
-    return calculateLiveStats(liveStatusData);
-  }, [liveStatusData]);
+  const liveStats = useMemo(
+    () => calculateLiveStats(liveStatusData),
+    [liveStatusData],
+  );
 
-  // Initial fetch and interval for live data
   useEffect(() => {
     fetchLiveData();
     const interval = setInterval(fetchLiveData, 60000);
     return () => clearInterval(interval);
   }, []);
 
-  // FIXED: Memoize dateRange to prevent infinite refetch loop
+  // ── Date range (includes 2-hour buffer when filter === "shift") ───────────
   const dateRange = useMemo(() => {
     if (customFrom && customTo) {
       return {
@@ -148,6 +140,7 @@ export default function Dashboard() {
     return getDateRangeForFilter(timeFilter);
   }, [customFrom, customTo, timeFilter]);
 
+  // ── Fetch machine data ────────────────────────────────────────────────────
   const {
     data: machineData = [],
     refetch: refetchMachineData,
@@ -164,17 +157,27 @@ export default function Dashboard() {
     staleTime: 10000,
   });
 
+  // ── Clip data to real shift boundaries (only for "shift" filter) ──────────
+  // Raw machineData may contain records that started up to 2 hours before the
+  // shift start. We clip them here so all analytics and display components only
+  // see time that falls within the actual shift window.
+  const displayData = useMemo(() => {
+    if (timeFilter !== "shift" || (customFrom && customTo)) {
+      return machineData;
+    }
+    const { from, to } = getCurrentShiftBoundaries();
+    return clipDataToShiftWindow(machineData, from, to);
+  }, [machineData, timeFilter, customFrom, customTo]);
+
   useEffect(() => {
     setCustomFrom(null);
     setCustomTo(null);
   }, [timeFilter]);
 
-  // WebSocket connection
+  // ── WebSocket ─────────────────────────────────────────────────────────────
   useEffect(() => {
     const ws = getWebSocketClient();
-
     const unsubscribe = ws.subscribe((message) => {
-      // Handle both machine_events inserts and live_status updates from Supabase Realtime
       if (
         message.type === "machine_update" ||
         message.type === "live_status_update"
@@ -192,16 +195,13 @@ export default function Dashboard() {
         }
       }
     });
-
-    return () => {
-      unsubscribe();
-    };
+    return () => unsubscribe();
   }, [refetchOverview]);
 
-  // Calculate analytics per machine
+  // ── Analytics (all using displayData) ────────────────────────────────────
   const machineAnalytics = overviewData.reduce(
     (acc, machine) => {
-      const machineRecords = machineData.filter(
+      const machineRecords = displayData.filter(
         (d) => d.machineName === machine.machineName,
       );
       acc[machine.machineName] = calculateMachineAnalytics(machineRecords);
@@ -210,19 +210,14 @@ export default function Dashboard() {
     {} as Record<string, any>,
   );
 
-  // Calculate overall analytics
-  const overallAnalytics = calculateMachineAnalytics(machineData);
+  const overallAnalytics = calculateMachineAnalytics(displayData);
 
-  // Removed chart data - using timeline instead
-
-  // Get live status for a specific machine
+  // ── Helpers ───────────────────────────────────────────────────────────────
   const getMachineLiveStatus = (
     machineName: string,
-  ): LiveMachineStatus | undefined => {
-    return liveStatusData.find((m) => m.machine === machineName);
-  };
+  ): LiveMachineStatus | undefined =>
+    liveStatusData.find((m) => m.machine === machineName);
 
-  // Export handler
   const handleExport = async () => {
     try {
       const blob = await exportToCSV({
@@ -232,9 +227,7 @@ export default function Dashboard() {
       const url = window.URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `factory-report-${
-        new Date().toISOString().split("T")[0]
-      }.csv`;
+      a.download = `factory-report-${new Date().toISOString().split("T")[0]}.csv`;
       document.body.appendChild(a);
       a.click();
       window.URL.revokeObjectURL(url);
@@ -267,8 +260,6 @@ export default function Dashboard() {
   const formatDateRangeForDisplay = (from: string, to: string) => {
     const fromDate = new Date(from);
     const toDate = new Date(to);
-
-    // Check if it's a single day
     if (fromDate.toDateString() === toDate.toDateString()) {
       return fromDate.toLocaleDateString("en-US", {
         month: "short",
@@ -276,8 +267,6 @@ export default function Dashboard() {
         year: "numeric",
       });
     }
-
-    // Format as range
     return `${fromDate.toLocaleDateString("en-US", {
       month: "short",
       day: "numeric",
@@ -296,31 +285,20 @@ export default function Dashboard() {
       month: "Last Month",
       "3months": "Last 3 Months",
     };
-
-    const filters: any = {
-      timeRange: timeRangeMap[timeFilter] || timeFilter,
-    };
-
-    if (shiftFilter && shiftFilter !== "All") {
-      filters.shift = shiftFilter;
-    }
-
+    const filters: any = { timeRange: timeRangeMap[timeFilter] || timeFilter };
+    if (shiftFilter && shiftFilter !== "All") filters.shift = shiftFilter;
     if (customFrom && customTo) {
       filters.customDate = formatDateRangeForDisplay(
         toLocalISOString(customFrom),
         toLocalISOString(customTo),
       );
     }
-
-    // Show reset button if any non-default filters are active
     const hasActiveFilters =
       timeFilter !== "shift" ||
       shiftFilter !== "All" ||
       customFrom !== null ||
       customTo !== null;
-
     setShowResetButton(hasActiveFilters);
-
     return filters;
   }, [timeFilter, shiftFilter, customFrom, customTo]);
 
@@ -360,10 +338,10 @@ export default function Dashboard() {
             fetchLiveData();
             toast.success("Dashboard refreshed");
           }}
-          onResetFilters={handleResetAllFilters} // Add this
+          onResetFilters={handleResetAllFilters}
           showShiftFilter
-          showResetButton={showResetButton} // Add this
-          currentFilters={currentFilters} // Add this
+          showResetButton={showResetButton}
+          currentFilters={currentFilters}
         />
 
         {isInitialLoading ? (
@@ -385,7 +363,6 @@ export default function Dashboard() {
 
             {/* Overview Tab */}
             <TabsContent value="overview" className="space-y-6">
-              {/* Efficiency Card - Only Running vs Downtime */}
               <Card className="p-6">
                 <h2 className="text-2xl font-bold mb-2">Machines Efficiency</h2>
                 <p className="text-sm text-muted-foreground mb-6">
@@ -423,13 +400,11 @@ export default function Dashboard() {
                 </div>
               </Card>
 
-              {/* Machine Cards - Sorted by machine number */}
+              {/* Machine Cards */}
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                 {sortMachinesByNumber(overviewData).map((machine) => {
                   const analytics = machineAnalytics[machine.machineName] || {};
-                  const liveUpdate = liveUpdates[machine.machineName];
                   const liveStatus = getMachineLiveStatus(machine.machineName);
-
                   return (
                     <MachineCard
                       key={machine.machineName}
@@ -451,22 +426,19 @@ export default function Dashboard() {
               </div>
             </TabsContent>
 
+            {/* Live Tab */}
             <TabsContent value="live" className="space-y-6">
               <LiveStatus />
             </TabsContent>
 
             {/* Analytics Tab */}
             <TabsContent value="analytics" className="space-y-6">
-              {/* Status Timeline */}
               <StatusTimeline
-                data={machineData}
+                data={displayData}
                 title="Status Timeline (Scroll left for history)"
               />
+              <ShiftAnalytics data={displayData} timeFilter={timeFilter} />
 
-              {/* Shift Performance */}
-              <ShiftAnalytics data={machineData} />
-
-              {/* Detailed Statistics */}
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
                 <Card className="p-4">
                   <h3 className="text-sm font-medium text-muted-foreground mb-2">
@@ -600,7 +572,7 @@ export default function Dashboard() {
               </div>
             </TabsContent>
 
-            {/* Live Data Tab */}
+            {/* Status Data Tab */}
             <TabsContent value="data" className="space-y-6">
               <div className="flex items-center gap-4 mb-4">
                 <span className="font-medium text-sm">Filter by Status:</span>
@@ -618,9 +590,8 @@ export default function Dashboard() {
                   </SelectContent>
                 </Select>
               </div>
-
               <DataTable
-                data={machineData}
+                data={displayData}
                 statusFilter={statusFilter}
                 title="Recent Machines Data"
                 maxRows={1000}

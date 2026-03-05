@@ -4,7 +4,6 @@
 // ─────────────────────────────────────────────────────────────────────────────
 import { supabase } from "./supabase";
 
-
 // ── Types ──────────────────────────────────────────────────────────────────
 
 export interface MachineDataFilters {
@@ -72,7 +71,7 @@ export interface DataflowAlert {
 function rowToMachineData(row: any): MachineData {
   return {
     _id: row.id,
-    timestamp: row.timestamp,       // kept as UTC ISO; display layer adds +5h
+    timestamp: row.timestamp, // kept as UTC ISO; display layer adds +5h
     machineName: row.machine_name,
     status: row.status,
     machinePower: row.machine_power ?? false,
@@ -95,7 +94,7 @@ export async function fetchMachineData(
   let query = supabase
     .from("machine_events")
     .select("*")
-    .order("timestamp", { ascending: true });
+    .order("timestamp", { ascending: false });
 
   if (filters?.machine) {
     query = query.eq("machine_name", filters.machine);
@@ -133,7 +132,8 @@ export async function fetchDashboardOverview(): Promise<DashboardOverview[]> {
     .in("machine_name", machineNames)
     .order("timestamp", { ascending: false });
 
-  if (evErr) throw new Error(`fetchDashboardOverview (events): ${evErr.message}`);
+  if (evErr)
+    throw new Error(`fetchDashboardOverview (events): ${evErr.message}`);
 
   const latestMap: Record<string, any> = {};
   for (const ev of latestEvents ?? []) {
@@ -143,7 +143,7 @@ export async function fetchDashboardOverview(): Promise<DashboardOverview[]> {
   return liveRows.map((row) => ({
     machineName: row.machine_name,
     latestStatus: row.status,
-    lastTimestamp: row.updated_at,   // UTC ISO
+    lastTimestamp: row.updated_at, // UTC ISO
     shift: latestMap[row.machine_name]?.shift ?? null,
   }));
 }
@@ -174,7 +174,7 @@ export async function fetchLiveStatus(): Promise<LiveMachineStatus[]> {
     status: row.status,
     machinePower: row.status !== "OFF",
     downtime: row.status === "DOWNTIME",
-    updatedAt: row.updated_at,   // UTC ISO
+    updatedAt: row.updated_at, // UTC ISO
   }));
 }
 

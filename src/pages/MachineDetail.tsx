@@ -7,6 +7,8 @@ import {
   calculateMachineAnalytics,
   formatDuration,
   getDateRangeForFilter,
+  clipDataToShiftWindow,
+  getCurrentShiftBoundaries,
 } from "@/lib/analytics";
 import { StatusBadge } from "@/components/StatusBadge";
 import { StatsCard } from "@/components/StatsCard";
@@ -63,7 +65,7 @@ export default function MachineDetail() {
     to: string;
   } | null>(null);
 
-  // FIXED: Memoize dateRange to prevent infinite refetch loop
+  // ── Date range (includes 2-hour buffer when filter === "shift") ───────────
   const dateRange = useMemo(() => {
     if (customDateRange) return customDateRange;
     return getDateRangeForFilter(timeFilter);
@@ -72,8 +74,6 @@ export default function MachineDetail() {
   const formatDateRangeForDisplay = (from: string, to: string) => {
     const fromDate = new Date(from);
     const toDate = new Date(to);
-
-    // Check if it's a single day
     if (fromDate.toDateString() === toDate.toDateString()) {
       return fromDate.toLocaleDateString("en-US", {
         month: "short",
@@ -81,8 +81,6 @@ export default function MachineDetail() {
         year: "numeric",
       });
     }
-
-    // Format as range
     return `${fromDate.toLocaleDateString("en-US", {
       month: "short",
       day: "numeric",
@@ -101,7 +99,6 @@ export default function MachineDetail() {
     toast.success("All filters have been reset");
   };
 
-  // Create current filters object for display
   const currentFilters = useMemo(() => {
     const timeRangeMap = {
       shift: "Current Shift",
@@ -110,26 +107,19 @@ export default function MachineDetail() {
       month: "Last Month",
       "3months": "Last 3 Months",
     };
-
-    const filters: any = {
-      timeRange: timeRangeMap[timeFilter] || timeFilter,
-    };
-
+    const filters: any = { timeRange: timeRangeMap[timeFilter] || timeFilter };
     if (customDateRange) {
       filters.customDate = formatDateRangeForDisplay(
         customDateRange.from,
         customDateRange.to,
       );
     }
-
-    // Show reset button if any non-default filters are active
     const hasActiveFilters = timeFilter !== "shift" || customDateRange !== null;
-
     setShowResetButton(hasActiveFilters);
-
     return filters;
   }, [timeFilter, customDateRange]);
 
+  // ── Fetch machine data ────────────────────────────────────────────────────
   const {
     data: machineData = [],
     refetch,
@@ -149,10 +139,21 @@ export default function MachineDetail() {
     staleTime: 10000,
   });
 
-  // WebSocket for live updates
+  // ── Clip data to real shift boundaries (only for "shift" filter) ──────────
+  // Raw machineData may contain records that started up to 2 hours before the
+  // shift start. We clip them here so analytics and timeline only show time
+  // that falls within the actual shift window.
+  const displayData = useMemo(() => {
+    if (timeFilter !== "shift" || customDateRange) {
+      return machineData;
+    }
+    const { from, to } = getCurrentShiftBoundaries();
+    return clipDataToShiftWindow(machineData, from, to);
+  }, [machineData, timeFilter, customDateRange]);
+
+  // ── WebSocket ─────────────────────────────────────────────────────────────
   useEffect(() => {
     if (!machineName) return;
-
     const ws = getWebSocketClient();
     const unsubscribe = ws.subscribe((message) => {
       if (
@@ -165,13 +166,13 @@ export default function MachineDetail() {
         toast.success(`${machineName} updated: ${message.status}`);
       }
     });
-
     return () => unsubscribe();
   }, [machineName, refetch]);
 
-  const analytics = calculateMachineAnalytics(machineData);
+  // ── Analytics (all using displayData) ────────────────────────────────────
+  const analytics = calculateMachineAnalytics(displayData);
 
-  // Export handler
+  // ── Export ────────────────────────────────────────────────────────────────
   const handleExport = async () => {
     if (!machineName) return;
     try {
@@ -183,9 +184,7 @@ export default function MachineDetail() {
       const url = window.URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `${machineName}-report-${
-        new Date().toISOString().split("T")[0]
-      }.csv`;
+      a.download = `${machineName}-report-${new Date().toISOString().split("T")[0]}.csv`;
       document.body.appendChild(a);
       a.click();
       window.URL.revokeObjectURL(url);
@@ -196,24 +195,14 @@ export default function MachineDetail() {
     }
   };
 
-  const latestRecord = machineData[0];
+  const latestRecord = displayData[0];
   const currentStatus = liveStatus?.status || latestRecord?.status || "UNKNOWN";
 
-  const chartData = [
-    {
-      name: machineName || "Machine",
-      running: Math.round(analytics.runningPercentage),
-      downtime: Math.round(analytics.downtimePercentage),
-      off: Math.round(analytics.offPercentage),
-    },
-  ];
-
-  // Get stops list for modal - using PKT timestamp parser
+  // ── Stops list (using displayData so clipped records are included) ────────
   const getStopsList = () => {
-    return machineData
+    return displayData
       .filter((d) => d.status === "OFF")
       .map((d) => {
-        // Parse PKT timestamp from API (already in PKT, not UTC)
         const date = parsePKTTimestamp(d.timestamp);
         return formatDisplayDateTime(date);
       });
@@ -229,13 +218,13 @@ export default function MachineDetail() {
             Back to Dashboard
           </Button>
         </Link>
+
         <div className="flex items-center gap-4">
           <div className="flex-1">
             <div className="flex items-center gap-3">
               <h1 className="text-4xl font-bold text-foreground">
                 {machineName}
               </h1>
-              {/* <StatusBadge status={currentStatus as any} showPulse /> */}
               {isFetching && (
                 <span className="text-sm text-muted-foreground animate-pulse">
                   Updating...
@@ -270,9 +259,9 @@ export default function MachineDetail() {
             refetch();
             toast.success("Data refreshed");
           }}
-          onResetFilters={handleResetAllFilters} // Add this
-          showResetButton={showResetButton} // Add this
-          currentFilters={currentFilters} // Add this
+          onResetFilters={handleResetAllFilters}
+          showResetButton={showResetButton}
+          currentFilters={currentFilters}
         />
 
         <Tabs defaultValue="overview" className="space-y-6">
@@ -284,7 +273,6 @@ export default function MachineDetail() {
 
           {/* Overview Tab */}
           <TabsContent value="overview" className="space-y-6">
-            {/* Key Metrics */}
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
               <StatsCard
                 title="Longest Run"
@@ -347,9 +335,9 @@ export default function MachineDetail() {
               </div>
             </Card>
 
-            {/* Status Timeline - Horizontal scrollable */}
+            {/* Status Timeline */}
             <StatusTimeline
-              data={machineData}
+              data={displayData}
               title="Status Distribution Timeline"
               machineName={machineName}
             />
@@ -357,10 +345,8 @@ export default function MachineDetail() {
 
           {/* Analytics Tab */}
           <TabsContent value="analytics" className="space-y-6">
-            {/* Shift Analytics */}
-            <ShiftAnalytics data={machineData} />
+            <ShiftAnalytics data={displayData} timeFilter={timeFilter} />
 
-            {/* Advanced Analytics Grid */}
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
               {/* Running Statistics */}
               <Card className="p-6">
@@ -535,10 +521,9 @@ export default function MachineDetail() {
                 </SelectContent>
               </Select>
             </div>
-
             <DataTable
               statusFilter={statusFilter}
-              data={machineData}
+              data={displayData}
               title={`${machineName} Data Log`}
               maxRows={1000}
               isLoading={isFetching}
