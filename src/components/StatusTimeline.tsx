@@ -1,6 +1,7 @@
 import { Card } from "@/components/ui/card";
 import { MachineData } from "@/lib/api";
-import { useRef, useEffect, useState, useMemo } from "react";
+import { useRef, useEffect, useState, useMemo, useCallback } from "react";
+import { createPortal } from "react-dom";
 import { ScrollArea, ScrollBar } from "@/components/ui/scroll-area";
 import {
   parsePKTTimestamp,
@@ -30,35 +31,49 @@ const STATUS_LABELS = {
 
 function formatDuration(seconds: number): string {
   if (!seconds || seconds <= 0) return "0s";
-
-  if (seconds < 60) {
-    return `${Math.round(seconds)}s`;
-  } else if (seconds < 3600) {
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  if (seconds < 3600) {
     const minutes = Math.floor(seconds / 60);
     const secs = Math.round(seconds % 60);
     return secs > 0 ? `${minutes}m ${secs}s` : `${minutes}m`;
-  } else if (seconds < 86400) {
+  }
+  if (seconds < 86400) {
     const hours = Math.floor(seconds / 3600);
     const minutes = Math.floor((seconds % 3600) / 60);
     return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
-  } else {
-    const days = Math.floor(seconds / 86400);
-    const hours = Math.floor((seconds % 86400) / 3600);
-    return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
   }
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
 }
+
+// ── Tooltip position state ───────────────────────────────────────────────────
+interface TooltipState {
+  index: number;
+  x: number; // left px (viewport-relative, already clamped)
+  y: number; // top px (viewport-relative, above the segment)
+  segment: MachineData;
+  startTime: Date;
+  endTime: Date;
+  duration: number;
+}
+
+// Tooltip width — must match the min-w in the tooltip JSX below
+const TOOLTIP_WIDTH = 200;
+const TOOLTIP_HEIGHT = 140; // approximate
+const MARGIN = 8; // px gap from viewport edge
 
 export function StatusTimeline({
   data,
   title = "Status Timeline",
   machineName,
 }: StatusTimelineProps) {
-  const [hoveredSegment, setHoveredSegment] = useState<number | null>(null);
+  const [tooltip, setTooltip] = useState<TooltipState | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [containerWidth, setContainerWidth] = useState(800);
 
-  // Filter and sort data
+  // Filter and sort data — always ascending for timeline
   const filteredData = machineName
     ? data.filter((d) => d.machineName === machineName)
     : data;
@@ -68,15 +83,14 @@ export function StatusTimeline({
       [...filteredData].sort(
         (a, b) =>
           parsePKTTimestamp(a.timestamp).getTime() -
-          parsePKTTimestamp(b.timestamp).getTime()
+          parsePKTTimestamp(b.timestamp).getTime(),
       ),
-    [filteredData]
+    [filteredData],
   );
 
-  // Calculate total duration
   const totalDuration = sortedData.reduce(
     (acc, d) => acc + (d.durationSeconds || 0),
-    0
+    0,
   );
 
   // Resize handler
@@ -86,72 +100,55 @@ export function StatusTimeline({
         setContainerWidth(containerRef.current.clientWidth);
       }
     };
-
     updateWidth();
     window.addEventListener("resize", updateWidth);
     return () => window.removeEventListener("resize", updateWidth);
   }, []);
 
-  // Calculate time positions and visible labels
-  const { timePositions, visibleLabels } = useMemo(() => {
-    if (sortedData.length === 0)
-      return { timePositions: [], visibleLabels: [] };
+  // Hide tooltip on scroll so it doesn't float in the wrong place
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const hide = () => setTooltip(null);
+    el.addEventListener("scroll", hide);
+    return () => el.removeEventListener("scroll", hide);
+  }, []);
 
-    const positions: {
-      time: string;
-      position: number;
-      date: string;
-      showDate: boolean;
-    }[] = [];
+  // Segment widths
+  const segmentWidths = useMemo(
+    () =>
+      sortedData.map((segment) => {
+        const duration = segment.durationSeconds || 0;
+        return Math.max((duration / totalDuration) * containerWidth, 60);
+      }),
+    [sortedData, totalDuration, containerWidth],
+  );
+
+  const totalWidth = segmentWidths.reduce((sum, w) => sum + w, 0);
+
+  // Visible time labels
+  const visibleLabels = useMemo(() => {
     const labels: { time: string; position: number; date?: string }[] = [];
-
-    // Calculate cumulative positions
     let cumulativePos = 0;
-    const segmentWidths: number[] = [];
-
-    // Calculate segment widths proportionally
-    sortedData.forEach((segment) => {
-      const duration = segment.durationSeconds || 0;
-      const width = Math.max((duration / totalDuration) * containerWidth, 60);
-      segmentWidths.push(width);
-    });
-
-    // Group segments into logical groups for labeling
-    for (let i = 0; i < sortedData.length; i++) {
-      const segment = sortedData[i];
+    sortedData.forEach((segment, i) => {
       const startTime = parsePKTTimestamp(segment.timestamp);
-      const segmentWidth = segmentWidths[i];
-      const segmentCenter = cumulativePos + segmentWidth / 2;
-
-      // Store position for this segment's start
-      positions.push({
-        time: formatDisplayTime(startTime),
-        position: cumulativePos,
-        date: formatDisplayDate(startTime),
-        showDate: i === 0, // Show date only for first segment
-      });
-
-      // Decide if we should show a label at this position
-      // Show label for: first segment, last segment, and at reasonable intervals
-      const shouldShowLabel =
+      const width = segmentWidths[i];
+      const shouldShow =
         i === 0 ||
         i === sortedData.length - 1 ||
-        segmentWidth > 100 || // Wide segments get their own label
-        i % Math.max(1, Math.floor(sortedData.length / 8)) === 0; // Every ~8th segment
-
-      if (shouldShowLabel) {
+        width > 100 ||
+        i % Math.max(1, Math.floor(sortedData.length / 8)) === 0;
+      if (shouldShow) {
         labels.push({
           time: formatDisplayTime(startTime),
           position: cumulativePos,
           date: i === 0 ? formatDisplayDate(startTime) : undefined,
         });
       }
-
-      cumulativePos += segmentWidth;
-    }
-
-    return { timePositions: positions, visibleLabels: labels, segmentWidths };
-  }, [sortedData, totalDuration, containerWidth]);
+      cumulativePos += width;
+    });
+    return labels;
+  }, [sortedData, segmentWidths]);
 
   // Scroll to end on mount
   useEffect(() => {
@@ -161,6 +158,37 @@ export function StatusTimeline({
       }, 100);
     }
   }, [sortedData.length]);
+
+  // ── Mouse enter handler — compute clamped viewport position ──────────────
+  const handleMouseEnter = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>, index: number) => {
+      const rect = (e.currentTarget as HTMLDivElement).getBoundingClientRect();
+      const segment = sortedData[index];
+      const duration = segment.durationSeconds || 0;
+      const startTime = parsePKTTimestamp(segment.timestamp);
+      const endTime = new Date(startTime.getTime() + duration * 1000);
+
+      // Ideal: horizontally centred above the segment
+      let x = rect.left + rect.width / 2 - TOOLTIP_WIDTH / 2;
+      let y = rect.top - TOOLTIP_HEIGHT - 12; // 12px gap above segment
+
+      // Clamp horizontally so tooltip never goes off-screen
+      x = Math.max(
+        MARGIN,
+        Math.min(x, window.innerWidth - TOOLTIP_WIDTH - MARGIN),
+      );
+
+      // If not enough room above, show below instead
+      if (y < MARGIN) {
+        y = rect.bottom + 12;
+      }
+
+      setTooltip({ index, x, y, segment, startTime, endTime, duration });
+    },
+    [sortedData],
+  );
+
+  const handleMouseLeave = useCallback(() => setTooltip(null), []);
 
   if (sortedData.length === 0) {
     return (
@@ -173,17 +201,9 @@ export function StatusTimeline({
     );
   }
 
-  // Calculate segment widths
-  const segmentWidths = sortedData.map((segment) => {
-    const duration = segment.durationSeconds || 0;
-    const width = Math.max((duration / totalDuration) * containerWidth, 60);
-    return width;
-  });
-
-  const totalWidth = segmentWidths.reduce((sum, width) => sum + width, 0);
-
   return (
-    <div className="p-6 overflow-visible!">
+    <div className="p-6">
+      {/* Legend */}
       <div className="flex items-center justify-between mb-6">
         <h3 className="text-lg font-bold">{title}</h3>
         <div className="flex items-center gap-4 text-sm">
@@ -198,99 +218,51 @@ export function StatusTimeline({
                   />
                   <span>{label}</span>
                 </div>
-              )
+              ),
           )}
         </div>
       </div>
 
-      <div ref={containerRef} className="mb-6  overflow-visible">
-        <ScrollArea className="overflow-visible!" ref={scrollRef}>
+      <div ref={containerRef} className="mb-6">
+        <ScrollArea ref={scrollRef}>
           <div
-            className="h-[370px] relative overflow-visible! pt-[130px]"
+            className="relative pt-4 pb-2"
             style={{ width: `${totalWidth}px` }}>
-            {/* Timeline header with date */}
+            {/* Date header */}
             <div className="mb-2 text-sm font-medium text-gray-600">
               {sortedData.length > 0 &&
                 formatDisplayDate(parsePKTTimestamp(sortedData[0].timestamp))}
             </div>
 
-            {/* Timeline segments */}
-            <div className="flex h-32 rounded-lg border border-gray-200 shadow-sm">
+            {/* Timeline bar */}
+            <div className="flex h-16 rounded-lg border border-gray-200 shadow-sm">
               {sortedData.map((segment, index) => {
-                const duration = segment.durationSeconds || 0;
                 const width = segmentWidths[index];
-                const startTime = parsePKTTimestamp(segment.timestamp);
-                const endTime = new Date(startTime.getTime() + duration * 1000);
-
                 return (
                   <div
                     key={segment._id || index}
-                    className={`relative group ${
+                    className={`relative ${
                       STATUS_COLORS[segment.status] || STATUS_COLORS.UNKNOWN
-                    } 
-          cursor-pointer transition-all duration-200 hover:brightness-110`}
-                    style={{
-                      width: `${width}px`,
-                      minWidth: "60px",
-                      height: "64px",
-                    }}
-                    onMouseEnter={() => setHoveredSegment(index)}
-                    onMouseLeave={() => setHoveredSegment(null)}>
-                    {hoveredSegment === index && (
-                      <div className="absolute bottom-full left-1/2 -translate-x-1/2 z-[9999]">
-                        <div className="relative mb-2">
-                          <div className="bg-gray-900 text-white text-xs rounded-lg shadow-xl p-3 whitespace-nowrap border border-gray-700 min-w-[180px]">
-                            <div className="font-bold mb-2 text-sm">
-                              {segment.machineName}
-                            </div>
-                            <div className="flex items-center gap-2 mb-2">
-                              <div
-                                className={`w-2 h-2 rounded-full ${
-                                  STATUS_COLORS[segment.status]
-                                }`}
-                              />
-                              <span className="font-medium">
-                                {STATUS_LABELS[segment.status]}
-                              </span>
-                            </div>
-                            <div className="space-y-1 text-gray-300">
-                              <div className="flex justify-between">
-                                <span>Start:</span>
-                                <span>{formatDisplayTime(startTime)}</span>
-                              </div>
-                              <div className="flex justify-between">
-                                <span>End:</span>
-                                <span>{formatDisplayTime(endTime)}</span>
-                              </div>
-                              <div className="flex justify-between font-medium mt-2 pt-2 border-t border-gray-700">
-                                <span>Duration:</span>
-                                <span>{formatDuration(duration)}</span>
-                              </div>
-                            </div>
-                          </div>
-                          {/* Tooltip arrow */}
-                          <div className="absolute -bottom-1 left-1/2 -translate-x-1/2 w-2 h-2 bg-gray-900 rotate-45" />
-                        </div>
-                      </div>
-                    )}
+                    } cursor-pointer transition-all duration-200 hover:brightness-110`}
+                    style={{ width: `${width}px`, minWidth: "60px" }}
+                    onMouseEnter={(e) => handleMouseEnter(e, index)}
+                    onMouseLeave={handleMouseLeave}>
                     {/* Duration label inside segment */}
-                    {width > 20 && (
-                      <div className="absolute inset-0 flex items-center justify-center">
+                    {width > 40 && (
+                      <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
                         <span
                           className={`text-xs font-semibold px-2 py-1 rounded bg-black/20 backdrop-blur-sm ${
-                            segment.status === "RUNNING"
-                              ? "text-white"
-                              : segment.status === "DOWNTIME"
+                            segment.status === "DOWNTIME"
                               ? "text-gray-900"
                               : "text-white"
                           }`}>
-                          {formatDuration(duration)}
+                          {formatDuration(segment.durationSeconds || 0)}
                         </span>
                       </div>
                     )}
-                    {/* Segment separator */}
+                    {/* Separator */}
                     {index < sortedData.length - 1 && (
-                      <div className="absolute right-0 top-0 h-full w-px bg-gray-800/30" />
+                      <div className="absolute right-0 top-0 h-full w-px bg-gray-800/30 pointer-events-none" />
                     )}
                   </div>
                 );
@@ -316,58 +288,47 @@ export function StatusTimeline({
                         {label.date}
                       </div>
                     )}
-                    {/* Marker line */}
                     <div className="w-px h-3 bg-gray-300 mt-1" />
                   </div>
                 </div>
               ))}
 
-              {/* Add an end time label if not already included */}
+              {/* End time label */}
               {sortedData.length > 0 &&
-                !visibleLabels.some(
-                  (l) =>
-                    l.time ===
-                    formatDisplayTime(
-                      new Date(
-                        parsePKTTimestamp(
-                          sortedData[sortedData.length - 1].timestamp
-                        ).getTime() +
-                          (sortedData[sortedData.length - 1].durationSeconds ||
-                            0) *
-                            1000
-                      )
-                    )
-                ) && (
-                  <div
-                    className="absolute text-xs text-gray-600"
-                    style={{
-                      left: `${totalWidth}px`,
-                      transform: "translateX(-100%)",
-                    }}>
-                    <div className="flex flex-col items-center">
-                      <div className="font-medium whitespace-nowrap">
-                        {formatDisplayTime(
-                          new Date(
-                            parsePKTTimestamp(
-                              sortedData[sortedData.length - 1].timestamp
-                            ).getTime() +
-                              (sortedData[sortedData.length - 1]
-                                .durationSeconds || 0) *
-                                1000
-                          )
-                        )}
+                (() => {
+                  const last = sortedData[sortedData.length - 1];
+                  const endTime = new Date(
+                    parsePKTTimestamp(last.timestamp).getTime() +
+                      (last.durationSeconds || 0) * 1000,
+                  );
+                  const endLabel = formatDisplayTime(endTime);
+                  const alreadyShown = visibleLabels.some(
+                    (l) => l.time === endLabel,
+                  );
+                  if (alreadyShown) return null;
+                  return (
+                    <div
+                      className="absolute text-xs text-gray-600"
+                      style={{
+                        left: `${totalWidth}px`,
+                        transform: "translateX(-100%)",
+                      }}>
+                      <div className="flex flex-col items-center">
+                        <div className="font-medium whitespace-nowrap">
+                          {endLabel}
+                        </div>
+                        <div className="w-px h-3 bg-gray-300 mt-1" />
                       </div>
-                      <div className="w-px h-3 bg-gray-300 mt-1" />
                     </div>
-                  </div>
-                )}
+                  );
+                })()}
             </div>
           </div>
           <ScrollBar orientation="horizontal" />
         </ScrollArea>
       </div>
 
-      {/* Summary stats - Improved layout */}
+      {/* Summary stats */}
       <div className="border-t pt-6">
         <h4 className="text-sm font-semibold text-gray-700 mb-4">
           Status Summary
@@ -375,18 +336,16 @@ export function StatusTimeline({
         <div className="grid grid-cols-3 gap-4">
           {Object.entries(STATUS_LABELS).map(([status, label]) => {
             if (status === "UNKNOWN") return null;
-
             const statusData = sortedData.filter((d) => d.status === status);
             const totalSeconds = statusData.reduce(
               (acc, d) => acc + (d.durationSeconds || 0),
-              0
+              0,
             );
             const count = statusData.length;
             const percentage =
               totalDuration > 0
                 ? ((totalSeconds / totalDuration) * 100).toFixed(1)
                 : "0.0";
-
             return (
               <div
                 key={status}
@@ -402,8 +361,8 @@ export function StatusTimeline({
                       status === "RUNNING"
                         ? "text-green-700"
                         : status === "DOWNTIME"
-                        ? "text-amber-700"
-                        : "text-red-700"
+                          ? "text-amber-700"
+                          : "text-red-700"
                     }`}>
                     {label}
                   </div>
@@ -422,6 +381,51 @@ export function StatusTimeline({
           })}
         </div>
       </div>
+
+      {/* ── Portal tooltip — renders on document.body, never clipped ── */}
+      {tooltip &&
+        createPortal(
+          <div
+            className="fixed z-[99999] pointer-events-none"
+            style={{ left: tooltip.x, top: tooltip.y }}>
+            <div
+              className="bg-gray-900 text-white text-xs rounded-lg shadow-xl p-3 border border-gray-700"
+              style={{ width: `${TOOLTIP_WIDTH}px` }}>
+              <div className="font-bold mb-2 text-sm">
+                {tooltip.segment.machineName}
+              </div>
+              <div className="flex items-center gap-2 mb-2">
+                <div
+                  className={`w-2 h-2 rounded-full flex-shrink-0 ${
+                    STATUS_COLORS[tooltip.segment.status]
+                  }`}
+                />
+                <span className="font-medium">
+                  {STATUS_LABELS[tooltip.segment.status]}
+                </span>
+              </div>
+              <div className="space-y-1 text-gray-300">
+                <div className="flex justify-between">
+                  <span>Start:</span>
+                  <span>{formatDisplayTime(tooltip.startTime)}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span>End:</span>
+                  <span>{formatDisplayTime(tooltip.endTime)}</span>
+                </div>
+                <div className="flex justify-between font-medium mt-2 pt-2 border-t border-gray-700">
+                  <span>Duration:</span>
+                  <span>{formatDuration(tooltip.duration)}</span>
+                </div>
+              </div>
+            </div>
+            {/* Arrow — points down toward the segment */}
+            <div className="flex justify-center mt-0">
+              <div className="w-2 h-2 bg-gray-900 rotate-45 -mt-1" />
+            </div>
+          </div>,
+          document.body,
+        )}
     </div>
   );
 }
