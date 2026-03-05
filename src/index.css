@@ -1,0 +1,190 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Definition of the design system. All colors, gradients, fonts, etc should be defined here. 
+All colors MUST be HSL.
+*/
+
+@layer base {
+  :root {
+    --background: 210 20% 98%;
+    --foreground: 215 25% 15%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 215 25% 15%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 215 25% 15%;
+
+    --primary: 215 85% 35%;
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 210 15% 92%;
+    --secondary-foreground: 215 25% 15%;
+
+    --muted: 210 15% 95%;
+    --muted-foreground: 215 15% 45%;
+
+    --accent: 200 95% 45%;
+    --accent-foreground: 0 0% 100%;
+
+    --destructive: 0 85% 55%;
+    --destructive-foreground: 0 0% 100%;
+
+    --success: 142 75% 40%;
+    --success-foreground: 0 0% 100%;
+
+    --warning: 38 92% 50%;
+    --warning-foreground: 0 0% 100%;
+
+    --running: 142 75% 40%;
+    --downtime: 38 92% 50%;
+    --off: 0 85% 55%;
+
+    --border: 210 20% 88%;
+    --input: 210 20% 88%;
+    --ring: 215 85% 35%;
+
+    --radius: 0.75rem;
+
+    --chart-1: 215 85% 35%;
+    --chart-2: 142 75% 40%;
+    --chart-3: 38 92% 50%;
+    --chart-4: 0 85% 55%;
+    --chart-5: 200 95% 45%;
+  }
+
+  .dark {
+    --background: 215 30% 8%;
+    --foreground: 210 20% 95%;
+
+    --card: 215 25% 12%;
+    --card-foreground: 210 20% 95%;
+
+    --popover: 215 25% 12%;
+    --popover-foreground: 210 20% 95%;
+
+    --primary: 215 90% 55%;
+    --primary-foreground: 215 30% 8%;
+
+    --secondary: 215 20% 18%;
+    --secondary-foreground: 210 20% 95%;
+
+    --muted: 215 20% 18%;
+    --muted-foreground: 210 15% 60%;
+
+    --accent: 200 95% 50%;
+    --accent-foreground: 215 30% 8%;
+
+    --destructive: 0 85% 55%;
+    --destructive-foreground: 0 0% 100%;
+
+    --success: 142 70% 45%;
+    --success-foreground: 0 0% 100%;
+
+    --warning: 38 92% 55%;
+    --warning-foreground: 0 0% 100%;
+
+    --running: 142 70% 45%;
+    --downtime: 38 92% 55%;
+    --off: 0 85% 55%;
+
+    --border: 215 20% 22%;
+    --input: 215 20% 22%;
+    --ring: 215 90% 55%;
+
+    --chart-1: 215 90% 55%;
+    --chart-2: 142 70% 45%;
+    --chart-3: 38 92% 55%;
+    --chart-4: 0 85% 55%;
+    --chart-5: 200 95% 50%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+@layer utilities {
+  .status-running {
+    @apply bg-success/10 text-success border-success/20;
+  }
+
+  .status-downtime {
+    @apply bg-warning/10 text-warning border-warning/20;
+  }
+
+  .status-off {
+    @apply bg-destructive/10 text-destructive border-destructive/20;
+  }
+
+  .pulse-running {
+    animation: pulse-green 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  }
+
+  .pulse-downtime {
+    animation: pulse-yellow 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  }
+
+  .pulse-off {
+    animation: pulse-red 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  }
+
+  @keyframes pulse-green {
+
+    0%,
+    100% {
+      opacity: 1;
+    }
+
+    50% {
+      opacity: 0.7;
+    }
+  }
+
+  @keyframes pulse-yellow {
+
+    0%,
+    100% {
+      opacity: 1;
+    }
+
+    50% {
+      opacity: 0.7;
+    }
+  }
+
+  @keyframes pulse-red {
+
+    0%,
+    100% {
+      opacity: 1;
+    }
+
+    50% {
+      opacity: 0.7;
+    }
+  }
+}
+
+
+@keyframes blink {
+
+  0%,
+  50%,
+  100% {
+    opacity: 1;
+  }
+
+  25%,
+  75% {
+    opacity: 0;
+  }
+}
