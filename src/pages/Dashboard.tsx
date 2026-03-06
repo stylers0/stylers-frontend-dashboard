@@ -16,7 +16,6 @@ import {
   getDateRangeForFilter,
   formatDuration,
   clipDataToShiftWindow,
-  getCurrentShiftBoundaries,
 } from "@/lib/analytics";
 import { MachineCard } from "@/components/MachineCard";
 import { StatsCard } from "@/components/StatsCard";
@@ -26,7 +25,7 @@ import { DataTable } from "@/components/DataTable";
 import { UtilizationGauge } from "@/components/UtilizationGauge";
 import { ShiftAnalytics } from "@/components/ShiftAnalytics";
 import { MachineStatusModal } from "@/components/MachineStatusModal";
-import { Activity, Power, AlertTriangle, RefreshCw } from "lucide-react";
+import { Activity, Power, AlertTriangle } from "lucide-react";
 import { toast } from "sonner";
 import { Card } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -40,7 +39,6 @@ import {
 } from "@/components/ui/select";
 import LiveStatus from "./LiveStatus";
 
-// Helper: sort machines by number (Machine_1, Machine_2, …)
 function sortMachinesByNumber<T extends { machineName: string }>(
   machines: T[],
 ): T[] {
@@ -54,7 +52,6 @@ function sortMachinesByNumber<T extends { machineName: string }>(
   });
 }
 
-// Helper: calculate live status counts
 const calculateLiveStats = (liveStatus: LiveMachineStatus[]) => ({
   RUNNING: liveStatus.filter((m) => m.status === "RUNNING").length,
   DOWNTIME: liveStatus.filter((m) => m.status === "DOWNTIME").length,
@@ -77,13 +74,10 @@ export default function Dashboard() {
   >("ALL");
   const [refreshingLive, setRefreshingLive] = useState(false);
   const [showResetButton, setShowResetButton] = useState(false);
-
-  // Modal state
   const [modalStatus, setModalStatus] = useState<
     "RUNNING" | "DOWNTIME" | "OFF" | null
   >(null);
 
-  // ── Fetch overview ────────────────────────────────────────────────────────
   const {
     data: overviewData = [],
     refetch: refetchOverview,
@@ -96,16 +90,13 @@ export default function Dashboard() {
     staleTime: 10000,
   });
 
-  // ── Fetch stats ───────────────────────────────────────────────────────────
-  const { data: statsData = {}, isLoading: isLoadingStats } =
-    useQuery<DashboardStats>({
-      queryKey: ["dashboard-stats"],
-      queryFn: fetchDashboardStats,
-      refetchInterval: 60000,
-      staleTime: 10000,
-    });
+  const { data: statsData = {} } = useQuery<DashboardStats>({
+    queryKey: ["dashboard-stats"],
+    queryFn: fetchDashboardStats,
+    refetchInterval: 60000,
+    staleTime: 10000,
+  });
 
-  // ── Live status ───────────────────────────────────────────────────────────
   const fetchLiveData = async () => {
     try {
       setRefreshingLive(true);
@@ -129,18 +120,30 @@ export default function Dashboard() {
     return () => clearInterval(interval);
   }, []);
 
-  // ── Date range (includes 2-hour buffer when filter === "shift") ───────────
+  // ── Date range ────────────────────────────────────────────────────────────
+  // dateRange.from  = buffered fetch start (2h before real window)
+  // dateRange.realFrom = the ACTUAL window start the user requested
+  // dateRange.to    = now (or shift end)
+  //
+  // We fetch using the buffered `from` so in-progress events are caught,
+  // then clip to `realFrom` so displayed data starts exactly where the
+  // user's selected window starts.
   const dateRange = useMemo(() => {
     if (customFrom && customTo) {
+      // For custom ranges: buffer 2h before the user's chosen from-time
+      const realFrom = toLocalISOString(customFrom);
+      const bufferedFrom = new Date(
+        new Date(realFrom).getTime() - 2 * 60 * 60 * 1000,
+      ).toISOString();
       return {
-        from: toLocalISOString(customFrom),
+        from: bufferedFrom,
         to: toLocalISOString(customTo),
+        realFrom: realFrom,
       };
     }
     return getDateRangeForFilter(timeFilter);
   }, [customFrom, customTo, timeFilter]);
 
-  // ── Fetch machine data ────────────────────────────────────────────────────
   const {
     data: machineData = [],
     refetch: refetchMachineData,
@@ -157,24 +160,21 @@ export default function Dashboard() {
     staleTime: 10000,
   });
 
-  // ── Clip data to real shift boundaries (only for "shift" filter) ──────────
-  // Raw machineData may contain records that started up to 2 hours before the
-  // shift start. We clip them here so all analytics and display components only
-  // see time that falls within the actual shift window.
+  // ── Clip to the REAL window start (not the buffered fetch start) ──────────
+  // This is the core fix for all filters:
+  //   "shift"    → clips to 07:00/15:00/23:00 PKT exactly
+  //   "day"      → clips to exactly 24h ago (e.g. yesterday 10:20 AM)
+  //   "week"     → clips to exactly 7 days ago
+  //   "custom"   → clips to exactly the from-date/time the user picked
   const displayData = useMemo(() => {
-    if (timeFilter !== "shift" || (customFrom && customTo)) {
-      return machineData;
-    }
-    const { from, to } = getCurrentShiftBoundaries();
-    return clipDataToShiftWindow(machineData, from, to);
-  }, [machineData, timeFilter, customFrom, customTo]);
+    return clipDataToShiftWindow(machineData, dateRange.realFrom, dateRange.to);
+  }, [machineData, dateRange.realFrom, dateRange.to]);
 
   useEffect(() => {
     setCustomFrom(null);
     setCustomTo(null);
   }, [timeFilter]);
 
-  // ── WebSocket ─────────────────────────────────────────────────────────────
   useEffect(() => {
     const ws = getWebSocketClient();
     const unsubscribe = ws.subscribe((message) => {
@@ -183,10 +183,7 @@ export default function Dashboard() {
         message.type === "live_status_update"
       ) {
         if (message.machine) {
-          setLiveUpdates((prev) => ({
-            ...prev,
-            [message.machine!]: message,
-          }));
+          setLiveUpdates((prev) => ({ ...prev, [message.machine!]: message }));
         }
         refetchOverview();
         fetchLiveData();
@@ -198,7 +195,6 @@ export default function Dashboard() {
     return () => unsubscribe();
   }, [refetchOverview]);
 
-  // ── Analytics (all using displayData) ────────────────────────────────────
   const machineAnalytics = overviewData.reduce(
     (acc, machine) => {
       const machineRecords = displayData.filter(
@@ -212,7 +208,6 @@ export default function Dashboard() {
 
   const overallAnalytics = calculateMachineAnalytics(displayData);
 
-  // ── Helpers ───────────────────────────────────────────────────────────────
   const getMachineLiveStatus = (
     machineName: string,
   ): LiveMachineStatus | undefined =>
@@ -221,7 +216,7 @@ export default function Dashboard() {
   const handleExport = async () => {
     try {
       const blob = await exportToCSV({
-        from: dateRange.from,
+        from: dateRange.realFrom,
         to: dateRange.to,
       });
       const url = window.URL.createObjectURL(blob);
@@ -235,14 +230,8 @@ export default function Dashboard() {
       toast.success("Report exported successfully!");
     } catch (error) {
       toast.error("Failed to export report");
-      console.error(error);
     }
   };
-
-  const totalMachines = overviewData.length;
-  const runningMachines = liveStats.RUNNING || 0;
-  const downtimeMachines = liveStats.DOWNTIME || 0;
-  const offMachines = liveStats.OFF || 0;
 
   const isInitialLoading = isLoadingOverview && overviewData.length === 0;
   const isUpdating = isFetchingOverview || isFetchingMachineData;
@@ -267,14 +256,7 @@ export default function Dashboard() {
         year: "numeric",
       });
     }
-    return `${fromDate.toLocaleDateString("en-US", {
-      month: "short",
-      day: "numeric",
-    })} - ${toDate.toLocaleDateString("en-US", {
-      month: "short",
-      day: "numeric",
-      year: "numeric",
-    })}`;
+    return `${fromDate.toLocaleDateString("en-US", { month: "short", day: "numeric" })} - ${toDate.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })}`;
   };
 
   const currentFilters = useMemo(() => {
@@ -293,12 +275,12 @@ export default function Dashboard() {
         toLocalISOString(customTo),
       );
     }
-    const hasActiveFilters =
+    setShowResetButton(
       timeFilter !== "shift" ||
-      shiftFilter !== "All" ||
-      customFrom !== null ||
-      customTo !== null;
-    setShowResetButton(hasActiveFilters);
+        shiftFilter !== "All" ||
+        customFrom !== null ||
+        customTo !== null,
+    );
     return filters;
   }, [timeFilter, shiftFilter, customFrom, customTo]);
 
@@ -321,7 +303,6 @@ export default function Dashboard() {
           </p>
         </div>
 
-        {/* Filter Bar */}
         <FilterBar
           timeFilter={timeFilter}
           onTimeFilterChange={setTimeFilter}
@@ -361,13 +342,12 @@ export default function Dashboard() {
               <TabsTrigger value="data">Status Data</TabsTrigger>
             </TabsList>
 
-            {/* Overview Tab */}
             <TabsContent value="overview" className="space-y-6">
               <Card className="p-6">
                 <h2 className="text-2xl font-bold mb-2">Machines Efficiency</h2>
                 <p className="text-sm text-muted-foreground mb-6">
-                  Efficiency for previous records = Total Running Time / (Total
-                  Running + Total Downtime) — OFF time excluded
+                  Efficiency = Total Running / (Running + Downtime) — OFF
+                  excluded
                 </p>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                   <UtilizationGauge
@@ -400,7 +380,6 @@ export default function Dashboard() {
                 </div>
               </Card>
 
-              {/* Machine Cards */}
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                 {sortMachinesByNumber(overviewData).map((machine) => {
                   const analytics = machineAnalytics[machine.machineName] || {};
@@ -426,19 +405,16 @@ export default function Dashboard() {
               </div>
             </TabsContent>
 
-            {/* Live Tab */}
             <TabsContent value="live" className="space-y-6">
               <LiveStatus />
             </TabsContent>
 
-            {/* Analytics Tab */}
             <TabsContent value="analytics" className="space-y-6">
               <StatusTimeline
                 data={displayData}
                 title="Status Timeline (Scroll left for history)"
               />
               <ShiftAnalytics data={displayData} timeFilter={timeFilter} />
-
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
                 <Card className="p-4">
                   <h3 className="text-sm font-medium text-muted-foreground mb-2">
@@ -471,7 +447,6 @@ export default function Dashboard() {
                     </div>
                   </div>
                 </Card>
-
                 <Card className="p-4">
                   <h3 className="text-sm font-medium text-muted-foreground mb-2">
                     Downtime Statistics
@@ -505,7 +480,6 @@ export default function Dashboard() {
                     </div>
                   </div>
                 </Card>
-
                 <Card className="p-4">
                   <h3 className="text-sm font-medium text-muted-foreground mb-2">
                     Off Time Statistics
@@ -537,7 +511,6 @@ export default function Dashboard() {
                     </div>
                   </div>
                 </Card>
-
                 <Card className="p-4">
                   <h3 className="text-sm font-medium text-muted-foreground mb-2">
                     Efficiency Analysis
@@ -572,7 +545,6 @@ export default function Dashboard() {
               </div>
             </TabsContent>
 
-            {/* Status Data Tab */}
             <TabsContent value="data" className="space-y-6">
               <div className="flex items-center gap-4 mb-4">
                 <span className="font-medium text-sm">Filter by Status:</span>
@@ -602,7 +574,6 @@ export default function Dashboard() {
         )}
       </div>
 
-      {/* Status Modal */}
       {modalStatus && (
         <MachineStatusModal
           isOpen={!!modalStatus}

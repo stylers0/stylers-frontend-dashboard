@@ -8,11 +8,8 @@ import {
   formatDuration,
   getDateRangeForFilter,
   clipDataToShiftWindow,
-  getCurrentShiftBoundaries,
 } from "@/lib/analytics";
-import { StatusBadge } from "@/components/StatusBadge";
 import { StatsCard } from "@/components/StatsCard";
-import { StatusTimelineHorizontal } from "@/components/StatusTimelineHorizontal";
 import { FilterBar } from "@/components/FilterBar";
 import { DataTable } from "@/components/DataTable";
 import { UtilizationGauge } from "@/components/UtilizationGauge";
@@ -44,11 +41,11 @@ import {
 import { toLocalISOString } from "@/components/toLocalISOString";
 import { parsePKTTimestamp, formatDisplayDateTime } from "@/lib/timeUtils";
 import { StatusTimeline } from "@/components/StatusTimeline";
+import { Link as RouterLink } from "react-router-dom";
 
 export default function MachineDetail() {
   const { machineName } = useParams<{ machineName: string }>();
   const [showResetButton, setShowResetButton] = useState(false);
-
   const [timeFilter, setTimeFilter] = useState<
     "shift" | "day" | "week" | "month" | "3months"
   >("shift");
@@ -56,18 +53,32 @@ export default function MachineDetail() {
   const [statusFilter, setStatusFilter] = useState<
     "ALL" | "RUNNING" | "DOWNTIME" | "OFF"
   >("ALL");
-
   const [stopsModalOpen, setStopsModalOpen] = useState(false);
   const [stopsList, setStopsList] = useState<string[]>([]);
-
   const [customDateRange, setCustomDateRange] = useState<{
     from: string;
     to: string;
   } | null>(null);
 
-  // ── Date range (includes 2-hour buffer when filter === "shift") ───────────
+  // ── Date range ────────────────────────────────────────────────────────────
+  // dateRange.from     = buffered fetch start (2h before real window)
+  // dateRange.realFrom = the ACTUAL window start the user requested
+  // dateRange.to       = end of window
+  //
+  // We fetch using buffered `from` so in-progress events are caught,
+  // then clip to `realFrom` so displayed data starts exactly where requested.
   const dateRange = useMemo(() => {
-    if (customDateRange) return customDateRange;
+    if (customDateRange) {
+      // For custom ranges: buffer 2h before the user's chosen from-time
+      const bufferedFrom = new Date(
+        new Date(customDateRange.from).getTime() - 2 * 60 * 60 * 1000,
+      ).toISOString();
+      return {
+        from: bufferedFrom,
+        to: customDateRange.to,
+        realFrom: customDateRange.from,
+      };
+    }
     return getDateRangeForFilter(timeFilter);
   }, [customDateRange, timeFilter]);
 
@@ -81,14 +92,7 @@ export default function MachineDetail() {
         year: "numeric",
       });
     }
-    return `${fromDate.toLocaleDateString("en-US", {
-      month: "short",
-      day: "numeric",
-    })} - ${toDate.toLocaleDateString("en-US", {
-      month: "short",
-      day: "numeric",
-      year: "numeric",
-    })}`;
+    return `${fromDate.toLocaleDateString("en-US", { month: "short", day: "numeric" })} - ${toDate.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })}`;
   };
 
   const handleResetAllFilters = () => {
@@ -114,8 +118,7 @@ export default function MachineDetail() {
         customDateRange.to,
       );
     }
-    const hasActiveFilters = timeFilter !== "shift" || customDateRange !== null;
-    setShowResetButton(hasActiveFilters);
+    setShowResetButton(timeFilter !== "shift" || customDateRange !== null);
     return filters;
   }, [timeFilter, customDateRange]);
 
@@ -139,17 +142,15 @@ export default function MachineDetail() {
     staleTime: 10000,
   });
 
-  // ── Clip data to real shift boundaries (only for "shift" filter) ──────────
-  // Raw machineData may contain records that started up to 2 hours before the
-  // shift start. We clip them here so analytics and timeline only show time
-  // that falls within the actual shift window.
+  // ── Clip to the REAL window start (not the buffered fetch start) ──────────
+  // This is the core fix for all filters:
+  //   "shift"    → clips to 07:00/15:00/23:00 PKT exactly
+  //   "day"      → clips to exactly 24h ago (e.g. yesterday 10:20 AM)
+  //   "week"     → clips to exactly 7 days ago at this exact time
+  //   "custom"   → clips to exactly the from-date/time the user picked
   const displayData = useMemo(() => {
-    if (timeFilter !== "shift" || customDateRange) {
-      return machineData;
-    }
-    const { from, to } = getCurrentShiftBoundaries();
-    return clipDataToShiftWindow(machineData, from, to);
-  }, [machineData, timeFilter, customDateRange]);
+    return clipDataToShiftWindow(machineData, dateRange.realFrom, dateRange.to);
+  }, [machineData, dateRange.realFrom, dateRange.to]);
 
   // ── WebSocket ─────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -169,16 +170,14 @@ export default function MachineDetail() {
     return () => unsubscribe();
   }, [machineName, refetch]);
 
-  // ── Analytics (all using displayData) ────────────────────────────────────
   const analytics = calculateMachineAnalytics(displayData);
 
-  // ── Export ────────────────────────────────────────────────────────────────
   const handleExport = async () => {
     if (!machineName) return;
     try {
       const blob = await exportToCSV({
         machine: machineName,
-        from: dateRange.from,
+        from: dateRange.realFrom,
         to: dateRange.to,
       });
       const url = window.URL.createObjectURL(blob);
@@ -195,23 +194,14 @@ export default function MachineDetail() {
     }
   };
 
-  const latestRecord = displayData[0];
-  const currentStatus = liveStatus?.status || latestRecord?.status || "UNKNOWN";
-
-  // ── Stops list (using displayData so clipped records are included) ────────
-  const getStopsList = () => {
-    return displayData
+  const getStopsList = () =>
+    displayData
       .filter((d) => d.status === "OFF")
-      .map((d) => {
-        const date = parsePKTTimestamp(d.timestamp);
-        return formatDisplayDateTime(date);
-      });
-  };
+      .map((d) => formatDisplayDateTime(parsePKTTimestamp(d.timestamp)));
 
   return (
     <div className="min-h-screen bg-background">
       <div className="container mx-auto p-6 space-y-6">
-        {/* Header */}
         <Link to="/">
           <Button variant="outline" size="sm">
             <ArrowLeft className="w-4 h-4 mr-2" />
@@ -237,7 +227,6 @@ export default function MachineDetail() {
           </div>
         </div>
 
-        {/* Filter Bar */}
         <FilterBar
           timeFilter={timeFilter}
           onTimeFilterChange={(value) => {
@@ -271,7 +260,6 @@ export default function MachineDetail() {
             <TabsTrigger value="data">Data Log</TabsTrigger>
           </TabsList>
 
-          {/* Overview Tab */}
           <TabsContent value="overview" className="space-y-6">
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
               <StatsCard
@@ -289,8 +277,7 @@ export default function MachineDetail() {
               />
               <div
                 onClick={() => {
-                  const stops = getStopsList();
-                  setStopsList(stops);
+                  setStopsList(getStopsList());
                   setStopsModalOpen(true);
                 }}
                 className="cursor-pointer">
@@ -310,11 +297,10 @@ export default function MachineDetail() {
               />
             </div>
 
-            {/* Efficiency Card */}
             <Card className="p-6">
               <h2 className="text-2xl font-bold mb-2">Machine Efficiency</h2>
               <p className="text-sm text-muted-foreground mb-6">
-                Efficiency = Running / (Running + Downtime) — OFF time excluded
+                Efficiency = Running / (Running + Downtime) — OFF excluded
               </p>
               <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
                 <UtilizationGauge
@@ -335,7 +321,6 @@ export default function MachineDetail() {
               </div>
             </Card>
 
-            {/* Status Timeline */}
             <StatusTimeline
               data={displayData}
               title="Status Distribution Timeline"
@@ -343,12 +328,10 @@ export default function MachineDetail() {
             />
           </TabsContent>
 
-          {/* Analytics Tab */}
           <TabsContent value="analytics" className="space-y-6">
             <ShiftAnalytics data={displayData} timeFilter={timeFilter} />
 
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-              {/* Running Statistics */}
               <Card className="p-6">
                 <div className="flex items-center gap-2 mb-4">
                   <Activity className="w-5 h-5 text-success" />
@@ -388,7 +371,6 @@ export default function MachineDetail() {
                 </div>
               </Card>
 
-              {/* Downtime Statistics */}
               <Card className="p-6">
                 <div className="flex items-center gap-2 mb-4">
                   <AlertTriangle className="w-5 h-5 text-warning" />
@@ -428,7 +410,6 @@ export default function MachineDetail() {
                 </div>
               </Card>
 
-              {/* Off Statistics */}
               <Card className="p-6">
                 <div className="flex items-center gap-2 mb-4">
                   <Power className="w-5 h-5 text-destructive" />
@@ -468,7 +449,6 @@ export default function MachineDetail() {
                 </div>
               </Card>
 
-              {/* Efficiency Card */}
               <Card className="p-6">
                 <div className="flex items-center gap-2 mb-4">
                   <TrendingUp className="w-5 h-5 text-primary" />
@@ -503,7 +483,6 @@ export default function MachineDetail() {
             </div>
           </TabsContent>
 
-          {/* Data Log Tab */}
           <TabsContent value="data" className="space-y-6">
             <div className="flex items-center gap-4 mb-4">
               <span className="font-medium text-sm">Filter by Status:</span>
@@ -532,7 +511,6 @@ export default function MachineDetail() {
         </Tabs>
       </div>
 
-      {/* Stops Modal */}
       <Dialog open={stopsModalOpen} onOpenChange={setStopsModalOpen}>
         <DialogContent className="max-w-md">
           <DialogHeader>
