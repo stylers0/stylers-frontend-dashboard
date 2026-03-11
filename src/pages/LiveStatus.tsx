@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useMemo } from "react";
+import React, { useEffect, useState, useMemo, useCallback } from "react";
 import {
   Card,
   CardContent,
@@ -12,6 +12,7 @@ import { fetchLiveStatus, LiveMachineStatus } from "@/lib/api";
 import { getWebSocketClient } from "@/lib/websocket";
 import { formatDisplayDateTime, parsePKTTimestamp } from "@/lib/timeUtils";
 import { Link } from "react-router-dom";
+import { toast } from "sonner";
 import {
   PlayCircle,
   AlertCircle,
@@ -71,24 +72,40 @@ const LiveStatus = () => {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [activeFilter, setActiveFilter] = useState<string | null>(null);
+  const [lastUpdated, setLastUpdated] = useState<Date>(new Date());
 
-  const fetchData = async () => {
+  // ── Core fetch function ───────────────────────────────────────────────────
+  const fetchData = useCallback(async (showToast = false) => {
     try {
       setRefreshing(true);
       const live = await fetchLiveStatus();
       setMachines(live);
+      setLastUpdated(new Date());
+      if (showToast) {
+        toast.success("Live status refreshed successfully");
+      }
     } catch (err) {
       console.error("Failed to fetch live status", err);
+      if (showToast) {
+        toast.error("Failed to refresh live status");
+      }
     } finally {
       setLoading(false);
       setRefreshing(false);
     }
-  };
+  }, []);
 
+  // ── Initial load + auto-refresh every 60 seconds ─────────────────────────
   useEffect(() => {
-    fetchData();
+    fetchData(false);
+    const interval = setInterval(() => {
+      fetchData(false); // silent background refresh
+    }, 60000);
+    return () => clearInterval(interval);
+  }, [fetchData]);
 
-    // Subscribe to Supabase Realtime for live_status changes
+  // ── WebSocket for real-time updates ──────────────────────────────────────
+  useEffect(() => {
     const ws = getWebSocketClient();
     const unsubscribe = ws.subscribe((message) => {
       if (message.type === "live_status_update" && message.machine) {
@@ -106,17 +123,14 @@ const LiveStatus = () => {
           next[idx] = updated;
           return next;
         });
+        setLastUpdated(new Date());
       }
     });
-
-    return () => {
-      unsubscribe();
-    };
+    return () => unsubscribe();
   }, []);
 
-  const handleRefresh = () => {
-    fetchData();
-  };
+  // Manual refresh — shows toast
+  const handleRefresh = () => fetchData(true);
 
   const extractMachineNumber = (machineName: string): number => {
     const match = machineName.match(/\d+/);
@@ -125,9 +139,7 @@ const LiveStatus = () => {
 
   const sortedMachines = useMemo(() => {
     return [...machines].sort((a, b) => {
-      const numA = extractMachineNumber(a.machine);
-      const numB = extractMachineNumber(b.machine);
-      return numA - numB;
+      return extractMachineNumber(a.machine) - extractMachineNumber(b.machine);
     });
   }, [machines]);
 
@@ -140,9 +152,7 @@ const LiveStatus = () => {
     setActiveFilter((prev) => (prev === status ? null : status));
   };
 
-  const clearFilter = () => {
-    setActiveFilter(null);
-  };
+  const clearFilter = () => setActiveFilter(null);
 
   if (loading) {
     return (
@@ -174,34 +184,32 @@ const LiveStatus = () => {
     color: string;
     icon: any;
     status: string;
-  }) => {
-    return (
-      <button
-        onClick={() => handleFilterClick(status)}
-        className={`${color} border-2 transition-all duration-200 hover:shadow-md w-full rounded-md`}>
-        <Card className="h-full border-0">
-          <CardContent className="p-6">
-            <div className="flex items-center justify-between">
-              <div className="flex items-start flex-col justify-start">
-                <div className="flex items-center gap-2">
-                  <p className="text-sm font-medium text-gray-600">{title}</p>
-                </div>
-                <h3 className="text-3xl font-bold mt-2">{count}</h3>
-                <p className="text-sm text-gray-500 mt-1">
-                  {totalMachines > 0
-                    ? `${Math.round((count / totalMachines) * 100)}%`
-                    : "0%"}
-                </p>
+  }) => (
+    <button
+      onClick={() => handleFilterClick(status)}
+      className={`${color} border-2 transition-all duration-200 hover:shadow-md w-full rounded-md`}>
+      <Card className="h-full border-0">
+        <CardContent className="p-6">
+          <div className="flex items-center justify-between">
+            <div className="flex items-start flex-col justify-start">
+              <div className="flex items-center gap-2">
+                <p className="text-sm font-medium text-gray-600">{title}</p>
               </div>
-              <div className="p-3 rounded-full bg-white/50">
-                <Icon className="w-6 h-6" />
-              </div>
+              <h3 className="text-3xl font-bold mt-2">{count}</h3>
+              <p className="text-sm text-gray-500 mt-1">
+                {totalMachines > 0
+                  ? `${Math.round((count / totalMachines) * 100)}%`
+                  : "0%"}
+              </p>
             </div>
-          </CardContent>
-        </Card>
-      </button>
-    );
-  };
+            <div className="p-3 rounded-full bg-white/50">
+              <Icon className="w-6 h-6" />
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+    </button>
+  );
 
   return (
     <div className="mt-4 space-y-6 mx-auto max-w-[1360px]">
@@ -243,13 +251,18 @@ const LiveStatus = () => {
               </p>
             </div>
           </div>
-          <Button onClick={clearFilter} variant="ghost" size="sm" className="gap-2">
+          <Button
+            onClick={clearFilter}
+            variant="ghost"
+            size="sm"
+            className="gap-2">
             <X className="w-4 h-4" />
             Clear Filter
           </Button>
         </div>
       )}
 
+      {/* Summary Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <SummaryCard
           title="Total Machines"
@@ -281,6 +294,7 @@ const LiveStatus = () => {
         />
       </div>
 
+      {/* Machine Grid */}
       <div>
         <div className="flex justify-between items-center mb-4">
           <div>
@@ -313,7 +327,10 @@ const LiveStatus = () => {
                   : "There are no machines to display at the moment."}
               </p>
               {activeFilter && (
-                <Button onClick={clearFilter} variant="outline" className="mt-4">
+                <Button
+                  onClick={clearFilter}
+                  variant="outline"
+                  className="mt-4">
                   Clear Filter
                 </Button>
               )}
@@ -366,7 +383,6 @@ const LiveStatus = () => {
                           {formattedLastUpdate}
                         </p>
                       </div>
-
                       <div className="pt-1">
                         <Button
                           variant="ghost"
@@ -385,15 +401,18 @@ const LiveStatus = () => {
         )}
       </div>
 
-      {/* Last Updated Footer */}
+      {/* Footer — shows live last-updated time */}
       <div className="text-center pt-4">
         <p className="text-sm text-gray-500 flex items-center justify-center gap-2">
           <Clock className="w-3 h-3" />
-          Last updated:{" "}
-          {new Date().toLocaleTimeString("en-US", {
+          Last refreshed:{" "}
+          {lastUpdated.toLocaleTimeString("en-US", {
             timeZone: "Asia/Karachi",
           })}{" "}
           PKT
+          <span className="text-xs text-gray-400">
+            (auto-refreshes every 60s)
+          </span>
         </p>
       </div>
     </div>
