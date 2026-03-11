@@ -121,22 +121,14 @@ export default function Dashboard() {
   }, []);
 
   // ── Date range ────────────────────────────────────────────────────────────
-  // dateRange.from  = buffered fetch start (2h before real window)
-  // dateRange.realFrom = the ACTUAL window start the user requested
-  // dateRange.to    = now (or shift end)
-  //
-  // We fetch using the buffered `from` so in-progress events are caught,
-  // then clip to `realFrom` so displayed data starts exactly where the
-  // user's selected window starts.
+  // dateRange.from = realFrom — the anchor record is fetched inside
+  // fetchMachineData itself, so no buffer offset needed here.
+  // clipDataToShiftWindow trims to exact boundaries after fetch.
   const dateRange = useMemo(() => {
     if (customFrom && customTo) {
-      // For custom ranges: buffer 2h before the user's chosen from-time
       const realFrom = toLocalISOString(customFrom);
-      const bufferedFrom = new Date(
-        new Date(realFrom).getTime() - 2 * 60 * 60 * 1000,
-      ).toISOString();
       return {
-        from: bufferedFrom,
+        from: realFrom,
         to: toLocalISOString(customTo),
         realFrom: realFrom,
       };

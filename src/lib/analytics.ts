@@ -145,11 +145,10 @@ import {
   PKT_OFFSET_MS,
 } from "./timeUtils";
 
-// How far before any window start we fetch from Supabase.
-// This ensures we always catch the in-progress event that was already running
-// when the window opened. clipDataToShiftWindow then trims it to the exact
-// window boundary so analytics and display are always accurate.
-const PREFETCH_BUFFER_MS = 2 * 60 * 60 * 1000; // 2 hours
+// NOTE: The old 2h prefetch buffer approach has been replaced.
+// fetchMachineData now always fetches 1 extra record before the window start
+// (the "anchor record") so clipDataToShiftWindow can clip it to the exact
+// window boundary — no matter how long the in-progress state has been running.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // getCurrentShiftBoundaries
@@ -172,15 +171,10 @@ export function getCurrentShiftBoundaries(): { from: string; to: string } {
 // ─────────────────────────────────────────────────────────────────────────────
 // getDateRangeForFilter
 //
-// Returns { from, to } for the Supabase query.
-// ALL filters now include a 2-hour prefetch buffer BEFORE the real window start
-// so that any event already in progress when the window opened is fetched.
-// clipDataToShiftWindow() trims those records to the exact window boundary.
-//
-// Example — "Last 24 Hours" at 10:20 AM:
-//   Real window:     yesterday 10:20 AM  →  now
-//   Fetched window:  yesterday 08:20 AM  →  now   (2h buffer)
-//   After clipping:  yesterday 10:20 AM  →  now   ✓ exact
+// Returns { from, to, realFrom } for use in Dashboard/MachineDetail.
+// `from` == `realFrom` — the buffer is now handled inside fetchMachineData
+// by always fetching 1 extra "anchor" record before the window start.
+// clipDataToShiftWindow() trims everything to the exact window boundaries.
 // ─────────────────────────────────────────────────────────────────────────────
 export function getDateRangeForFilter(
   filter: "shift" | "day" | "week" | "month" | "3months",
@@ -219,11 +213,9 @@ export function getDateRangeForFilter(
     }
   }
 
-  // Buffered fetch start — always 2h before the real window
-  const bufferedFrom = new Date(realFromMs - PREFETCH_BUFFER_MS).toISOString();
   const realFrom = new Date(realFromMs).toISOString();
-
-  return { from: bufferedFrom, to, realFrom };
+  // from === realFrom; buffer is handled in fetchMachineData via anchor record
+  return { from: realFrom, to, realFrom };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -85,35 +85,67 @@ function rowToMachineData(row: any): MachineData {
 
 // ── fetchMachineData ───────────────────────────────────────────────────────
 /**
- * filters.from / filters.to are PKT local ISO strings (no timezone suffix).
- * We convert them to UTC before sending to Supabase.
+ * Fetches machine events for the given window.
+ *
+ * ANCHOR RECORD PATTERN:
+ * When a `from` boundary is supplied we also fetch the single most-recent
+ * record whose timestamp is strictly BEFORE `from`.  If that record's
+ * end time (timestamp + durationSeconds) crosses into the window, it means
+ * the machine was mid-status when the window opened.  clipDataToShiftWindow()
+ * then trims it to the exact window boundary so the timeline starts cleanly.
+ *
+ * This replaces the old fixed 2-hour prefetch buffer, which broke for any
+ * status that had been running longer than 2 hours before the window started.
  */
 export async function fetchMachineData(
   filters?: MachineDataFilters,
 ): Promise<MachineData[]> {
+  // ── 1. Main window query ─────────────────────────────────────────────────
   let query = supabase
     .from("machine_events")
     .select("*")
-    .order("timestamp", { ascending: false });
+    .order("timestamp", { ascending: false }); // newest first
 
-  if (filters?.machine) {
-    query = query.eq("machine_name", filters.machine);
-  }
-  if (filters?.from) {
-    // filters.from is a real UTC ISO string (e.g. "2026-03-03T11:00:00.000Z")
-    // produced by getDateRangeForFilter or dateToUTCIso — pass directly.
-    query = query.gte("timestamp", filters.from);
-  }
-  if (filters?.to) {
-    query = query.lte("timestamp", filters.to);
-  }
-  if (filters?.limit) {
-    query = query.limit(filters.limit);
-  }
+  if (filters?.machine) query = query.eq("machine_name", filters.machine);
+  if (filters?.from) query = query.gte("timestamp", filters.from);
+  if (filters?.to) query = query.lte("timestamp", filters.to);
+  if (filters?.limit) query = query.limit(filters.limit);
 
   const { data, error } = await query;
   if (error) throw new Error(`fetchMachineData: ${error.message}`);
-  return (data ?? []).map(rowToMachineData);
+  const mainRecords = (data ?? []).map(rowToMachineData);
+
+  // ── 2. Anchor record (only when a from boundary is set) ──────────────────
+  // Fetches the 1 record immediately before the window to catch any status
+  // that was already in progress when the window opened — no matter how long
+  // it has been running (fixes the broken 2h buffer approach).
+  if (filters?.from) {
+    let anchorQuery = supabase
+      .from("machine_events")
+      .select("*")
+      .lt("timestamp", filters.from) // strictly BEFORE window start
+      .order("timestamp", { ascending: false })
+      .limit(1);
+
+    if (filters?.machine)
+      anchorQuery = anchorQuery.eq("machine_name", filters.machine);
+
+    const { data: anchorData } = await anchorQuery;
+    if (anchorData && anchorData.length > 0) {
+      const anchor = rowToMachineData(anchorData[0]);
+      const anchorEndMs =
+        new Date(anchor.timestamp).getTime() +
+        (anchor.durationSeconds || 0) * 1000;
+      const windowStartMs = new Date(filters.from).getTime();
+
+      // Only prepend if it actually overlaps into the window
+      if (anchorEndMs > windowStartMs) {
+        mainRecords.push(anchor); // clipDataToShiftWindow will trim it to windowStart
+      }
+    }
+  }
+
+  return mainRecords;
 }
 
 // ── fetchDashboardOverview ─────────────────────────────────────────────────
@@ -143,7 +175,7 @@ export async function fetchDashboardOverview(): Promise<DashboardOverview[]> {
   return liveRows.map((row) => ({
     machineName: row.machine_name,
     latestStatus: row.status,
-    lastTimestamp: row.updated_at, // UTC ISO
+    lastTimestamp: row.updated_at,
     shift: latestMap[row.machine_name]?.shift ?? null,
   }));
 }
@@ -174,7 +206,7 @@ export async function fetchLiveStatus(): Promise<LiveMachineStatus[]> {
     status: row.status,
     machinePower: row.status !== "OFF",
     downtime: row.status === "DOWNTIME",
-    updatedAt: row.updated_at, // UTC ISO
+    updatedAt: row.updated_at,
   }));
 }
 
@@ -236,7 +268,6 @@ export async function exportToCSV(filters?: {
 
   const PKT_MS = 5 * 60 * 60 * 1000;
   const rows = data.map((d) => {
-    // Convert UTC timestamp to PKT for CSV readability
     const pktDate = new Date(new Date(d.timestamp).getTime() + PKT_MS);
     const pktStr = pktDate.toISOString().replace("T", " ").replace("Z", " PKT");
     return [
