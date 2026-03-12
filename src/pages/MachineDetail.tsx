@@ -6,9 +6,9 @@ import { getWebSocketClient } from "@/lib/websocket";
 import {
   calculateMachineAnalytics,
   formatDuration,
-  getDateRangeForFilter,
   clipDataToShiftWindow,
 } from "@/lib/analytics";
+import { useFilters } from "@/context/FilterContext";
 import { StatsCard } from "@/components/StatsCard";
 import { FilterBar } from "@/components/FilterBar";
 import { DataTable } from "@/components/DataTable";
@@ -45,59 +45,31 @@ import { Link as RouterLink } from "react-router-dom";
 
 export default function MachineDetail() {
   const { machineName } = useParams<{ machineName: string }>();
-  const [showResetButton, setShowResetButton] = useState(false);
-  const [timeFilter, setTimeFilter] = useState<
-    "shift" | "day" | "week" | "month" | "3months"
-  >("shift");
+  const {
+    timeFilter,
+    setTimeFilter,
+    statusFilter,
+    setStatusFilter,
+    customFrom,
+    customTo,
+    setCustomRange,
+    dateRange,
+    resetAllFilters,
+    showResetButton,
+    customDateLabel,
+  } = useFilters();
+
   const [liveStatus, setLiveStatus] = useState<any>(null);
-  const [statusFilter, setStatusFilter] = useState<
-    "ALL" | "RUNNING" | "DOWNTIME" | "OFF"
-  >("ALL");
   const [stopsModalOpen, setStopsModalOpen] = useState(false);
   const [stopsList, setStopsList] = useState<string[]>([]);
-  const [customDateRange, setCustomDateRange] = useState<{
-    from: string;
-    to: string;
-  } | null>(null);
-
-  // ── Date range ────────────────────────────────────────────────────────────
-  // No buffer offset needed here — fetchMachineData fetches the anchor record
-  // (last record before window start) internally, and clipDataToShiftWindow
-  // trims everything to exact boundaries.
-  const dateRange = useMemo(() => {
-    if (customDateRange) {
-      return {
-        from: customDateRange.from,
-        to: customDateRange.to,
-        realFrom: customDateRange.from,
-      };
-    }
-    return getDateRangeForFilter(timeFilter);
-  }, [customDateRange, timeFilter]);
-
-  const formatDateRangeForDisplay = (from: string, to: string) => {
-    const fromDate = new Date(from);
-    const toDate = new Date(to);
-    if (fromDate.toDateString() === toDate.toDateString()) {
-      return fromDate.toLocaleDateString("en-US", {
-        month: "short",
-        day: "numeric",
-        year: "numeric",
-      });
-    }
-    return `${fromDate.toLocaleDateString("en-US", { month: "short", day: "numeric" })} - ${toDate.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })}`;
-  };
 
   const handleResetAllFilters = () => {
-    setTimeFilter("shift");
-    setCustomDateRange(null);
-    setStatusFilter("ALL");
-    setShowResetButton(false);
+    resetAllFilters();
     toast.success("All filters have been reset");
   };
 
   const currentFilters = useMemo(() => {
-    const timeRangeMap = {
+    const timeRangeMap: Record<string, string> = {
       shift: "Current Shift",
       day: "Last 24 Hours",
       week: "Last Week",
@@ -105,15 +77,9 @@ export default function MachineDetail() {
       "3months": "Last 3 Months",
     };
     const filters: any = { timeRange: timeRangeMap[timeFilter] || timeFilter };
-    if (customDateRange) {
-      filters.customDate = formatDateRangeForDisplay(
-        customDateRange.from,
-        customDateRange.to,
-      );
-    }
-    setShowResetButton(timeFilter !== "shift" || customDateRange !== null);
+    if (customDateLabel) filters.customDate = customDateLabel;
     return filters;
-  }, [timeFilter, customDateRange]);
+  }, [timeFilter, customDateLabel]);
 
   // ── Fetch machine data ────────────────────────────────────────────────────
   const {
@@ -222,19 +188,11 @@ export default function MachineDetail() {
 
         <FilterBar
           timeFilter={timeFilter}
-          onTimeFilterChange={(value) => {
-            setTimeFilter(value);
-            setCustomDateRange(null);
-          }}
+          onTimeFilterChange={setTimeFilter}
+          currentCustomFrom={customFrom}
+          currentCustomTo={customTo}
           onCustomDateChange={(from, to) => {
-            if (from && to) {
-              setCustomDateRange({
-                from: toLocalISOString(from),
-                to: toLocalISOString(to),
-              });
-            } else {
-              setCustomDateRange(null);
-            }
+            setCustomRange(from ?? null, to ?? null);
           }}
           onExport={handleExport}
           onRefresh={() => {

@@ -13,10 +13,10 @@ import {
 import { getWebSocketClient } from "@/lib/websocket";
 import {
   calculateMachineAnalytics,
-  getDateRangeForFilter,
   formatDuration,
   clipDataToShiftWindow,
 } from "@/lib/analytics";
+import { useFilters } from "@/context/FilterContext";
 import { MachineCard } from "@/components/MachineCard";
 import { StatsCard } from "@/components/StatsCard";
 import { StatusTimeline } from "@/components/StatusTimeline";
@@ -61,19 +61,25 @@ const calculateLiveStats = (liveStatus: LiveMachineStatus[]) => ({
 });
 
 export default function Dashboard() {
-  const [timeFilter, setTimeFilter] = useState<
-    "shift" | "day" | "week" | "month" | "3months"
-  >("shift");
-  const [shiftFilter, setShiftFilter] = useState<string>("All");
+  const {
+    timeFilter,
+    setTimeFilter,
+    shiftFilter,
+    setShiftFilter,
+    statusFilter,
+    setStatusFilter,
+    customFrom,
+    customTo,
+    setCustomRange,
+    dateRange,
+    resetAllFilters,
+    showResetButton,
+    customDateLabel,
+  } = useFilters();
+
   const [liveUpdates, setLiveUpdates] = useState<Record<string, any>>({});
   const [liveStatusData, setLiveStatusData] = useState<LiveMachineStatus[]>([]);
-  const [customFrom, setCustomFrom] = useState<Date | null>(null);
-  const [customTo, setCustomTo] = useState<Date | null>(null);
-  const [statusFilter, setStatusFilter] = useState<
-    "ALL" | "RUNNING" | "DOWNTIME" | "OFF"
-  >("ALL");
   const [refreshingLive, setRefreshingLive] = useState(false);
-  const [showResetButton, setShowResetButton] = useState(false);
   const [modalStatus, setModalStatus] = useState<
     "RUNNING" | "DOWNTIME" | "OFF" | null
   >(null);
@@ -120,21 +126,7 @@ export default function Dashboard() {
     return () => clearInterval(interval);
   }, []);
 
-  // ── Date range ────────────────────────────────────────────────────────────
-  // dateRange.from = realFrom — the anchor record is fetched inside
-  // fetchMachineData itself, so no buffer offset needed here.
-  // clipDataToShiftWindow trims to exact boundaries after fetch.
-  const dateRange = useMemo(() => {
-    if (customFrom && customTo) {
-      const realFrom = toLocalISOString(customFrom);
-      return {
-        from: realFrom,
-        to: toLocalISOString(customTo),
-        realFrom: realFrom,
-      };
-    }
-    return getDateRangeForFilter(timeFilter);
-  }, [customFrom, customTo, timeFilter]);
+  // dateRange comes from useFilters() — shared with MachineDetail
 
   const {
     data: machineData = [],
@@ -162,10 +154,7 @@ export default function Dashboard() {
     return clipDataToShiftWindow(machineData, dateRange.realFrom, dateRange.to);
   }, [machineData, dateRange.realFrom, dateRange.to]);
 
-  useEffect(() => {
-    setCustomFrom(null);
-    setCustomTo(null);
-  }, [timeFilter]);
+  // Custom range reset is handled inside setTimeFilter() in FilterContext
 
   useEffect(() => {
     const ws = getWebSocketClient();
@@ -229,30 +218,12 @@ export default function Dashboard() {
   const isUpdating = isFetchingOverview || isFetchingMachineData;
 
   const handleResetAllFilters = () => {
-    setTimeFilter("shift");
-    setShiftFilter("All");
-    setCustomFrom(null);
-    setCustomTo(null);
-    setStatusFilter("ALL");
-    setShowResetButton(false);
+    resetAllFilters();
     toast.success("All filters have been reset");
   };
 
-  const formatDateRangeForDisplay = (from: string, to: string) => {
-    const fromDate = new Date(from);
-    const toDate = new Date(to);
-    if (fromDate.toDateString() === toDate.toDateString()) {
-      return fromDate.toLocaleDateString("en-US", {
-        month: "short",
-        day: "numeric",
-        year: "numeric",
-      });
-    }
-    return `${fromDate.toLocaleDateString("en-US", { month: "short", day: "numeric" })} - ${toDate.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })}`;
-  };
-
   const currentFilters = useMemo(() => {
-    const timeRangeMap = {
+    const timeRangeMap: Record<string, string> = {
       shift: "Current Shift",
       day: "Last 24 Hours",
       week: "Last Week",
@@ -261,20 +232,9 @@ export default function Dashboard() {
     };
     const filters: any = { timeRange: timeRangeMap[timeFilter] || timeFilter };
     if (shiftFilter && shiftFilter !== "All") filters.shift = shiftFilter;
-    if (customFrom && customTo) {
-      filters.customDate = formatDateRangeForDisplay(
-        toLocalISOString(customFrom),
-        toLocalISOString(customTo),
-      );
-    }
-    setShowResetButton(
-      timeFilter !== "shift" ||
-        shiftFilter !== "All" ||
-        customFrom !== null ||
-        customTo !== null,
-    );
+    if (customDateLabel) filters.customDate = customDateLabel;
     return filters;
-  }, [timeFilter, shiftFilter, customFrom, customTo]);
+  }, [timeFilter, shiftFilter, customDateLabel]);
 
   return (
     <div className="min-h-screen bg-background">
@@ -300,9 +260,10 @@ export default function Dashboard() {
           onTimeFilterChange={setTimeFilter}
           shiftFilter={shiftFilter}
           onShiftFilterChange={setShiftFilter}
+          currentCustomFrom={customFrom}
+          currentCustomTo={customTo}
           onCustomDateChange={(from, to) => {
-            setCustomFrom(from);
-            setCustomTo(to);
+            setCustomRange(from ?? null, to ?? null);
           }}
           onExport={handleExport}
           onRefresh={() => {
