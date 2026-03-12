@@ -67,6 +67,16 @@ export interface DataflowAlert {
   message: string;
 }
 
+export interface CollectorHealth {
+  id: string;
+  lastSeen: string | null; // UTC ISO
+  status: "online" | "offline" | string;
+  /** true if status === "online" AND last_seen within last 5 minutes */
+  isHealthy: boolean;
+  /** how many minutes ago last_seen was (null if never seen) */
+  minutesSinceLastSeen: number | null;
+}
+
 // ── Row → MachineData mapper ───────────────────────────────────────────────
 function rowToMachineData(row: any): MachineData {
   return {
@@ -89,13 +99,23 @@ function rowToMachineData(row: any): MachineData {
  *
  * ANCHOR RECORD PATTERN:
  * When a `from` boundary is supplied we also fetch the single most-recent
- * record whose timestamp is strictly BEFORE `from`.  If that record's
- * end time (timestamp + durationSeconds) crosses into the window, it means
- * the machine was mid-status when the window opened.  clipDataToShiftWindow()
- * then trims it to the exact window boundary so the timeline starts cleanly.
+ * record whose timestamp is strictly BEFORE `from` — per machine.
+ * If that record's end time (timestamp + durationSeconds) crosses into the
+ * window, it means the machine was mid-status when the window opened.
+ * clipDataToShiftWindow() then trims it to the exact window boundary so the
+ * timeline starts cleanly.
  *
  * This replaces the old fixed 2-hour prefetch buffer, which broke for any
  * status that had been running longer than 2 hours before the window started.
+ *
+ * IMPORTANT — per-machine anchors on Dashboard:
+ * The original implementation used a single global .limit(1) anchor query
+ * with no machine filter. This meant only ONE record was fetched across all
+ * machines, whichever had the most recent event before the window. That stray
+ * record was pushed into mainRecords and ended up attributed to the wrong
+ * machine (e.g. Machine_5 card showed 100% DOWNTIME because its anchor was
+ * the only one fetched). The fix fires one anchor query per machine in
+ * parallel via Promise.all so every machine gets its own correct anchor.
  */
 export async function fetchMachineData(
   filters?: MachineDataFilters,
@@ -115,32 +135,58 @@ export async function fetchMachineData(
   if (error) throw new Error(`fetchMachineData: ${error.message}`);
   const mainRecords = (data ?? []).map(rowToMachineData);
 
-  // ── 2. Anchor record (only when a from boundary is set) ──────────────────
-  // Fetches the 1 record immediately before the window to catch any status
-  // that was already in progress when the window opened — no matter how long
-  // it has been running (fixes the broken 2h buffer approach).
+  // ── 2. Anchor record(s) — one per machine, strictly before the window ────
   if (filters?.from) {
-    let anchorQuery = supabase
-      .from("machine_events")
-      .select("*")
-      .lt("timestamp", filters.from) // strictly BEFORE window start
-      .order("timestamp", { ascending: false })
-      .limit(1);
+    const windowStartMs = new Date(filters.from).getTime();
 
-    if (filters?.machine)
-      anchorQuery = anchorQuery.eq("machine_name", filters.machine);
+    if (filters?.machine) {
+      // ── Single-machine path (MachineDetail) ─────────────────────────────
+      const { data: anchorData } = await supabase
+        .from("machine_events")
+        .select("*")
+        .eq("machine_name", filters.machine)
+        .lt("timestamp", filters.from)
+        .order("timestamp", { ascending: false })
+        .limit(1);
 
-    const { data: anchorData } = await anchorQuery;
-    if (anchorData && anchorData.length > 0) {
-      const anchor = rowToMachineData(anchorData[0]);
-      const anchorEndMs =
-        new Date(anchor.timestamp).getTime() +
-        (anchor.durationSeconds || 0) * 1000;
-      const windowStartMs = new Date(filters.from).getTime();
+      if (anchorData && anchorData.length > 0) {
+        const anchor = rowToMachineData(anchorData[0]);
+        const anchorEndMs =
+          new Date(anchor.timestamp).getTime() +
+          (anchor.durationSeconds || 0) * 1000;
+        if (anchorEndMs > windowStartMs) {
+          mainRecords.push(anchor);
+        }
+      }
+    } else {
+      // ── All-machines path (Dashboard) ────────────────────────────────────
+      // Collect distinct machine names from the main window results so we
+      // only fire anchor queries for machines that have data in this window.
+      const machineNames = [...new Set(mainRecords.map((r) => r.machineName))];
 
-      // Only prepend if it actually overlaps into the window
-      if (anchorEndMs > windowStartMs) {
-        mainRecords.push(anchor); // clipDataToShiftWindow will trim it to windowStart
+      // Fire all anchor queries in parallel — one per machine
+      const anchorResults = await Promise.all(
+        machineNames.map((name) =>
+          supabase
+            .from("machine_events")
+            .select("*")
+            .eq("machine_name", name)
+            .lt("timestamp", filters.from!)
+            .order("timestamp", { ascending: false })
+            .limit(1),
+        ),
+      );
+
+      for (const { data: anchorData } of anchorResults) {
+        if (!anchorData || anchorData.length === 0) continue;
+        const anchor = rowToMachineData(anchorData[0]);
+        const anchorEndMs =
+          new Date(anchor.timestamp).getTime() +
+          (anchor.durationSeconds || 0) * 1000;
+        // Only prepend if this record actually overlaps into the window
+        if (anchorEndMs > windowStartMs) {
+          mainRecords.push(anchor);
+        }
       }
     }
   }
@@ -243,6 +289,34 @@ export async function fetchDataflowAlert(): Promise<DataflowAlert> {
   };
 }
 
+// ── fetchCollectorHealth ───────────────────────────────────────────────────
+export async function fetchCollectorHealth(): Promise<CollectorHealth[]> {
+  const { data, error } = await supabase
+    .from("collector_health")
+    .select("id, last_seen, status");
+
+  if (error) throw new Error(`fetchCollectorHealth: ${error.message}`);
+
+  const now = Date.now();
+  return (data ?? []).map((row) => {
+    const lastSeenMs = row.last_seen ? new Date(row.last_seen).getTime() : null;
+    const minutesSinceLastSeen =
+      lastSeenMs !== null ? Math.floor((now - lastSeenMs) / 60_000) : null;
+    const isHealthy =
+      row.status === "online" &&
+      minutesSinceLastSeen !== null &&
+      minutesSinceLastSeen < 5;
+
+    return {
+      id: row.id,
+      lastSeen: row.last_seen ?? null,
+      status: row.status ?? "offline",
+      isHealthy,
+      minutesSinceLastSeen,
+    };
+  });
+}
+
 // ── exportToCSV ────────────────────────────────────────────────────────────
 export async function exportToCSV(filters?: {
   machine?: string;
@@ -283,41 +357,4 @@ export async function exportToCSV(filters?: {
 
   const csv = [headers.join(","), ...rows].join("\n");
   return new Blob([csv], { type: "text/csv;charset=utf-8;" });
-}
-
-export interface CollectorHealth {
-  id: string;
-  lastSeen: string | null; // UTC ISO
-  status: "online" | "offline" | string;
-  /** true if status === "online" AND last_seen within last 5 minutes */
-  isHealthy: boolean;
-  /** how many minutes ago last_seen was (null if never seen) */
-  minutesSinceLastSeen: number | null;
-}
-
-export async function fetchCollectorHealth(): Promise<CollectorHealth[]> {
-  const { data, error } = await supabase
-    .from("collector_health")
-    .select("id, last_seen, status");
-
-  if (error) throw new Error(`fetchCollectorHealth: ${error.message}`);
-
-  const now = Date.now();
-  return (data ?? []).map((row) => {
-    const lastSeenMs = row.last_seen ? new Date(row.last_seen).getTime() : null;
-    const minutesSinceLastSeen =
-      lastSeenMs !== null ? Math.floor((now - lastSeenMs) / 60_000) : null;
-    const isHealthy =
-      row.status === "online" &&
-      minutesSinceLastSeen !== null &&
-      minutesSinceLastSeen < 5;
-
-    return {
-      id: row.id,
-      lastSeen: row.last_seen ?? null,
-      status: row.status ?? "offline",
-      isHealthy,
-      minutesSinceLastSeen,
-    };
-  });
 }
