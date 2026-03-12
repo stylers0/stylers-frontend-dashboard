@@ -19,7 +19,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Download, RefreshCw, CalendarIcon, X, Filter } from "lucide-react";
-import { Badge } from "@/components/ui/badge"; // Add this import
+import { Badge } from "@/components/ui/badge";
 
 interface FilterBarProps {
   timeFilter: "shift" | "day" | "week" | "month" | "3months";
@@ -27,43 +27,98 @@ interface FilterBarProps {
     value: "shift" | "day" | "week" | "month" | "3months",
   ) => void;
   onCustomDateChange?: (from: Date | null, to: Date | null) => void;
+  // Pass the currently active custom dates from context so FilterBar
+  // can restore its internal inputs when it remounts after navigation
+  currentCustomFrom?: Date | null;
+  currentCustomTo?: Date | null;
   shiftFilter?: string;
   onShiftFilterChange?: (value: string) => void;
   onExport?: () => void;
   onRefresh?: () => void;
-  onResetFilters?: () => void; // Add this prop
+  onResetFilters?: () => void;
   showShiftFilter?: boolean;
-  showResetButton?: boolean; // Add this prop
+  showResetButton?: boolean;
   currentFilters?: {
-    // Add this prop for displaying current filters
     timeRange: string;
     shift?: string;
     customDate?: string;
   };
 }
 
+// ── helpers ──────────────────────────────────────────────────────────────────
+function dateToInputValue(d: Date): string {
+  // Returns "YYYY-MM-DD" for the calendar
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function timeFromDate(d: Date): string {
+  // Returns "HH:MM" for the time input
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
 export function FilterBar({
   timeFilter,
   onTimeFilterChange,
   onCustomDateChange,
+  currentCustomFrom,
+  currentCustomTo,
   shiftFilter = "All",
   onShiftFilterChange,
   onExport,
   onRefresh,
-  onResetFilters, // Add this
+  onResetFilters,
   showShiftFilter = false,
-  showResetButton = false, // Add this
-  currentFilters, // Add this
+  showResetButton = false,
+  currentFilters,
 }: FilterBarProps) {
   const [customRangeOpen, setCustomRangeOpen] = useState(false);
-  const [startDate, setStartDate] = useState<Date>(new Date());
-  const [endDate, setEndDate] = useState<Date>(new Date());
-  const [startTime, setStartTime] = useState("00:00");
-  const [endTime, setEndTime] = useState("23:59");
+
+  // ── Initialise from context values so state survives navigation ──────────
+  const [startDate, setStartDate] = useState<Date>(() => {
+    if (currentCustomFrom) return currentCustomFrom;
+    const d = new Date();
+    d.setHours(7, 0, 0, 0);
+    return d;
+  });
+  const [endDate, setEndDate] = useState<Date>(() => {
+    if (currentCustomTo) return currentCustomTo;
+    const d = new Date();
+    d.setHours(7, 0, 0, 0);
+    return d;
+  });
+  const [startTime, setStartTime] = useState<string>(() =>
+    currentCustomFrom ? timeFromDate(currentCustomFrom) : "07:00",
+  );
+  const [endTime, setEndTime] = useState<string>(() =>
+    currentCustomTo ? timeFromDate(currentCustomTo) : "07:00",
+  );
+
+  // When context custom dates change externally (e.g. reset), sync inputs
+  useEffect(() => {
+    if (currentCustomFrom) {
+      setStartDate(currentCustomFrom);
+      setStartTime(timeFromDate(currentCustomFrom));
+    }
+    if (currentCustomTo) {
+      setEndDate(currentCustomTo);
+      setEndTime(timeFromDate(currentCustomTo));
+    }
+    // If both are cleared (reset), go back to defaults
+    if (!currentCustomFrom && !currentCustomTo) {
+      const d = new Date();
+      d.setHours(7, 0, 0, 0);
+      setStartDate(d);
+      setEndDate(new Date(d));
+      setStartTime("07:00");
+      setEndTime("07:00");
+    }
+  }, [currentCustomFrom, currentCustomTo]);
 
   const handleApplyCustom = () => {
     if (startDate && endDate) {
-      // Combine date and time
       const [startHours, startMinutes] = startTime.split(":").map(Number);
       const [endHours, endMinutes] = endTime.split(":").map(Number);
 
@@ -79,30 +134,27 @@ export function FilterBar({
   };
 
   const handleResetFilters = () => {
-    // Reset to default filters
     onTimeFilterChange?.("shift");
-    if (onShiftFilterChange) {
-      onShiftFilterChange?.("All");
-    }
+    onShiftFilterChange?.("All");
     onCustomDateChange?.(null, null);
-    if (onResetFilters) {
-      onResetFilters();
-    }
+    onResetFilters?.();
   };
 
-  // Reset custom dates whenever timeFilter changes
+  // Only reset local inputs when timeFilter changes AND there's no active
+  // custom range in context — prevents clearing on navigation back
   useEffect(() => {
-    setStartDate(new Date());
-    setEndDate(new Date());
-    setStartTime("00:00");
-    setEndTime("23:59");
-    onCustomDateChange?.(null, null);
+    if (!currentCustomFrom && !currentCustomTo) {
+      const d = new Date();
+      d.setHours(7, 0, 0, 0);
+      setStartDate(d);
+      setEndDate(new Date(d));
+      setStartTime("07:00");
+      setEndTime("07:00");
+    }
   }, [timeFilter]);
 
   return (
     <div className="space-y-4">
-      {/* Current Filters Badge */}
-
       <div className="flex flex-wrap items-center gap-3">
         {/* Time Filter */}
         <div className="flex items-center gap-2">
@@ -191,7 +243,6 @@ export function FilterBar({
                 </div>
               </div>
 
-              {/* Action Button */}
               <Button
                 onClick={handleApplyCustom}
                 className="w-full mt-4 bg-primary text-primary-foreground font-semibold hover:bg-primary/90 transition rounded-xl py-2">
@@ -202,7 +253,6 @@ export function FilterBar({
         </div>
 
         <div className="flex items-center gap-2 ml-auto">
-          {/* Reset Filters Button */}
           {showResetButton && onResetFilters && (
             <Button
               variant="outline"
@@ -213,7 +263,6 @@ export function FilterBar({
               Reset Filters
             </Button>
           )}
-
           {onRefresh && (
             <Button variant="outline" size="sm" onClick={onRefresh}>
               <RefreshCw className="w-4 h-4 mr-2" />
@@ -228,20 +277,20 @@ export function FilterBar({
           )}
         </div>
       </div>
+
+      {/* Active filter badge */}
       {currentFilters && (
         <div className="flex flex-wrap items-center gap-2 p-3 bg-muted/50 rounded-lg">
           <Filter className="w-4 h-4 text-muted-foreground" />
           <span className="text-sm font-medium text-muted-foreground">
-            Current Filters:
+            Active Filter:
           </span>
-          {!currentFilters.customDate && (
+          {!currentFilters.customDate ? (
             <Badge variant="secondary" className="gap-1">
               <span className="font-medium">Time:</span>{" "}
               {currentFilters.timeRange}
             </Badge>
-          )}
-
-          {currentFilters.customDate && (
+          ) : (
             <Badge variant="secondary" className="gap-1">
               <span className="font-medium">Custom:</span>{" "}
               {currentFilters.customDate}

@@ -284,3 +284,40 @@ export async function exportToCSV(filters?: {
   const csv = [headers.join(","), ...rows].join("\n");
   return new Blob([csv], { type: "text/csv;charset=utf-8;" });
 }
+
+export interface CollectorHealth {
+  id: string;
+  lastSeen: string | null; // UTC ISO
+  status: "online" | "offline" | string;
+  /** true if status === "online" AND last_seen within last 5 minutes */
+  isHealthy: boolean;
+  /** how many minutes ago last_seen was (null if never seen) */
+  minutesSinceLastSeen: number | null;
+}
+
+export async function fetchCollectorHealth(): Promise<CollectorHealth[]> {
+  const { data, error } = await supabase
+    .from("collector_health")
+    .select("id, last_seen, status");
+
+  if (error) throw new Error(`fetchCollectorHealth: ${error.message}`);
+
+  const now = Date.now();
+  return (data ?? []).map((row) => {
+    const lastSeenMs = row.last_seen ? new Date(row.last_seen).getTime() : null;
+    const minutesSinceLastSeen =
+      lastSeenMs !== null ? Math.floor((now - lastSeenMs) / 60_000) : null;
+    const isHealthy =
+      row.status === "online" &&
+      minutesSinceLastSeen !== null &&
+      minutesSinceLastSeen < 5;
+
+    return {
+      id: row.id,
+      lastSeen: row.last_seen ?? null,
+      status: row.status ?? "offline",
+      isHealthy,
+      minutesSinceLastSeen,
+    };
+  });
+}
