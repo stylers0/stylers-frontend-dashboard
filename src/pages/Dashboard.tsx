@@ -4,11 +4,15 @@ import {
   fetchDashboardOverview,
   fetchDashboardStats,
   fetchMachineData,
+  fetchServerAnalytics,
   exportToCSV,
   fetchLiveStatus,
   LiveMachineStatus,
   DashboardOverview,
   DashboardStats,
+  ServerAnalytics,
+  isLargeWindow,
+  DISPLAY_ROW_LIMIT,
 } from "@/lib/api";
 import { getWebSocketClient } from "@/lib/websocket";
 import {
@@ -128,6 +132,8 @@ export default function Dashboard() {
 
   // dateRange comes from useFilters() — shared with MachineDetail
 
+  const largeWindow = isLargeWindow(dateRange.from, dateRange.to);
+
   const {
     data: machineData = [],
     refetch: refetchMachineData,
@@ -139,9 +145,21 @@ export default function Dashboard() {
       fetchMachineData({
         from: dateRange.from,
         to: dateRange.to,
-        limit: 99999,
+        // No explicit limit — api.ts applies DISPLAY_ROW_LIMIT automatically.
+        // For wide windows the row cap is fine for timeline/table display;
+        // analytics totals come from the server-side RPC below.
       }),
     staleTime: 10000,
+  });
+
+  // For wide date windows (week / month / 3-months) fetch analytics totals
+  // from the database via SUM() aggregation instead of summing client-side
+  // over a capped row set — this is accurate regardless of row volume.
+  const { data: serverAnalytics = [] } = useQuery<ServerAnalytics[]>({
+    queryKey: ["server-analytics", dateRange.from, dateRange.to],
+    queryFn: () => fetchServerAnalytics(dateRange.from, dateRange.to),
+    enabled: largeWindow,
+    staleTime: 30000,
   });
 
   // ── Clip to the REAL window start (not the buffered fetch start) ──────────
@@ -176,18 +194,90 @@ export default function Dashboard() {
     return () => unsubscribe();
   }, [refetchOverview]);
 
-  const machineAnalytics = overviewData.reduce(
-    (acc, machine) => {
-      const machineRecords = displayData.filter(
-        (d) => d.machineName === machine.machineName,
-      );
-      acc[machine.machineName] = calculateMachineAnalytics(machineRecords);
-      return acc;
-    },
-    {} as Record<string, any>,
-  );
+  const machineAnalytics = useMemo(() => {
+    return overviewData.reduce(
+      (acc, machine) => {
+        if (largeWindow && serverAnalytics.length > 0) {
+          // Use server-computed totals for wide windows — accurate regardless
+          // of how many rows the display query returned.
+          const sa = serverAnalytics.find(
+            (s) => s.machineName === machine.machineName,
+          );
+          if (sa) {
+            const total =
+              sa.runningSeconds + sa.downtimeSeconds + sa.offSeconds;
+            const active = sa.runningSeconds + sa.downtimeSeconds;
+            acc[machine.machineName] = {
+              totalRecords: sa.totalRecords,
+              runningTime: sa.runningSeconds,
+              downtimeTime: sa.downtimeSeconds,
+              offTime: sa.offSeconds,
+              runningPercentage:
+                total > 0 ? (sa.runningSeconds / total) * 100 : 0,
+              downtimePercentage:
+                total > 0 ? (sa.downtimeSeconds / total) * 100 : 0,
+              offPercentage: total > 0 ? (sa.offSeconds / total) * 100 : 0,
+              utilizationPercentage:
+                active > 0 ? (sa.runningSeconds / active) * 100 : 0,
+              efficiencyPercentage:
+                active > 0 ? (sa.runningSeconds / active) * 100 : 0,
+              longestRunDuration: 0,
+              numberOfOffs: 0,
+              averageOffDuration: 0,
+              averageDowntimeDuration: 0,
+              statusCounts: {
+                RUNNING: 0,
+                DOWNTIME: 0,
+                OFF: 0,
+              },
+            };
+            return acc;
+          }
+        }
+        // Short window or RPC not yet available — compute from fetched rows.
+        const machineRecords = displayData.filter(
+          (d) => d.machineName === machine.machineName,
+        );
+        acc[machine.machineName] = calculateMachineAnalytics(machineRecords);
+        return acc;
+      },
+      {} as Record<string, any>,
+    );
+  }, [overviewData, displayData, largeWindow, serverAnalytics]);
 
-  const overallAnalytics = calculateMachineAnalytics(displayData);
+  const overallAnalytics = useMemo(() => {
+    if (largeWindow && serverAnalytics.length > 0) {
+      const totals = serverAnalytics.reduce(
+        (acc, sa) => {
+          acc.running += sa.runningSeconds;
+          acc.downtime += sa.downtimeSeconds;
+          acc.off += sa.offSeconds;
+          acc.records += sa.totalRecords;
+          return acc;
+        },
+        { running: 0, downtime: 0, off: 0, records: 0 },
+      );
+      const total = totals.running + totals.downtime + totals.off;
+      const active = totals.running + totals.downtime;
+      return {
+        totalRecords: totals.records,
+        runningTime: totals.running,
+        downtimeTime: totals.downtime,
+        offTime: totals.off,
+        runningPercentage: total > 0 ? (totals.running / total) * 100 : 0,
+        downtimePercentage: total > 0 ? (totals.downtime / total) * 100 : 0,
+        offPercentage: total > 0 ? (totals.off / total) * 100 : 0,
+        utilizationPercentage: active > 0 ? (totals.running / active) * 100 : 0,
+        efficiencyPercentage: active > 0 ? (totals.running / active) * 100 : 0,
+        longestRunDuration: 0,
+        numberOfOffs: 0,
+        averageOffDuration: 0,
+        averageDowntimeDuration: 0,
+        statusCounts: { RUNNING: 0, DOWNTIME: 0, OFF: 0 },
+      };
+    }
+    return calculateMachineAnalytics(displayData);
+  }, [displayData, largeWindow, serverAnalytics]);
 
   const getMachineLiveStatus = (
     machineName: string,
@@ -277,6 +367,21 @@ export default function Dashboard() {
           showResetButton={showResetButton}
           currentFilters={currentFilters}
         />
+
+        {/* Info banner for wide date windows */}
+        {largeWindow && (
+          <div className="flex items-start gap-3 rounded-lg border border-blue-200 bg-blue-50 dark:border-blue-800 dark:bg-blue-950/30 px-4 py-3 text-sm text-blue-800 dark:text-blue-300">
+            <span className="mt-0.5 shrink-0">ℹ️</span>
+            <span>
+              <strong>Wide date range selected.</strong> Analytics totals
+              (Running / Downtime / Off %) are calculated in the database for
+              full accuracy across all records. The timeline and data table show
+              the most recent{" "}
+              <strong>{DISPLAY_ROW_LIMIT.toLocaleString()}</strong> events — use{" "}
+              <em>Export CSV</em> to download the complete dataset.
+            </span>
+          </div>
+        )}
 
         {isInitialLoading ? (
           <div className="flex items-center justify-center py-20">
