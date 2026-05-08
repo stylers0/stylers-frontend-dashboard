@@ -77,6 +77,20 @@ export interface CollectorHealth {
   minutesSinceLastSeen: number | null;
 }
 
+/**
+ * Server-side analytics aggregation — returned by the
+ * get_machine_analytics Postgres RPC.
+ * The RPC computes SUM(duration_seconds) grouped by status entirely in
+ * the database, so no row data is transferred to the client.
+ */
+export interface ServerAnalytics {
+  machineName: string;
+  runningSeconds: number;
+  downtimeSeconds: number;
+  offSeconds: number;
+  totalRecords: number;
+}
+
 // ── Row → MachineData mapper ───────────────────────────────────────────────
 function rowToMachineData(row: any): MachineData {
   return {
@@ -93,43 +107,61 @@ function rowToMachineData(row: any): MachineData {
   };
 }
 
+// ── How many rows is "safe" to pull for timeline / table display ───────────
+// Analytics for wide windows are computed server-side via fetchServerAnalytics().
+// This cap only affects what's shown in the DataTable and StatusTimeline.
+export const DISPLAY_ROW_LIMIT = 2000;
+
+const ONE_WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * True when the selected date window is wider than 7 days.
+ * Used by pages to decide whether to show the analytics-from-server notice
+ * and whether the table is showing a capped subset.
+ */
+export function isLargeWindow(from?: string, to?: string): boolean {
+  if (!from || !to) return false;
+  return new Date(to).getTime() - new Date(from).getTime() > ONE_WEEK_MS;
+}
+
 // ── fetchMachineData ───────────────────────────────────────────────────────
 /**
  * Fetches machine events for the given window.
  *
- * ANCHOR RECORD PATTERN:
+ * ROW CAP STRATEGY
+ * ─────────────────
+ * Instead of limit: 99999 (which transfers massive data and times out):
+ *
+ * • Short windows  (≤ 7 days)  → fetch up to DISPLAY_ROW_LIMIT rows.
+ *   For a shift or a day this will always be the complete dataset.
+ *
+ * • Wide windows   (> 7 days)  → same cap, but analytics must come from
+ *   fetchServerAnalytics() which runs SUM() inside Postgres — no row
+ *   transfer needed for totals.
+ *
+ * ANCHOR RECORD PATTERN (unchanged):
  * When a `from` boundary is supplied we also fetch the single most-recent
  * record whose timestamp is strictly BEFORE `from` — per machine.
  * If that record's end time (timestamp + durationSeconds) crosses into the
  * window, it means the machine was mid-status when the window opened.
- * clipDataToShiftWindow() then trims it to the exact window boundary so the
- * timeline starts cleanly.
- *
- * This replaces the old fixed 2-hour prefetch buffer, which broke for any
- * status that had been running longer than 2 hours before the window started.
- *
- * IMPORTANT — per-machine anchors on Dashboard:
- * The original implementation used a single global .limit(1) anchor query
- * with no machine filter. This meant only ONE record was fetched across all
- * machines, whichever had the most recent event before the window. That stray
- * record was pushed into mainRecords and ended up attributed to the wrong
- * machine (e.g. Machine_5 card showed 100% DOWNTIME because its anchor was
- * the only one fetched). The fix fires one anchor query per machine in
- * parallel via Promise.all so every machine gets its own correct anchor.
+ * clipDataToShiftWindow() then trims it to the exact window boundary so
+ * the timeline starts cleanly.
  */
 export async function fetchMachineData(
   filters?: MachineDataFilters,
 ): Promise<MachineData[]> {
+  const rowLimit = filters?.limit ?? DISPLAY_ROW_LIMIT;
+
   // ── 1. Main window query ─────────────────────────────────────────────────
   let query = supabase
     .from("machine_events")
     .select("*")
-    .order("timestamp", { ascending: false }); // newest first
+    .order("timestamp", { ascending: false }) // newest first
+    .limit(rowLimit);
 
   if (filters?.machine) query = query.eq("machine_name", filters.machine);
   if (filters?.from) query = query.gte("timestamp", filters.from);
   if (filters?.to) query = query.lte("timestamp", filters.to);
-  if (filters?.limit) query = query.limit(filters.limit);
 
   const { data, error } = await query;
   if (error) throw new Error(`fetchMachineData: ${error.message}`);
@@ -160,11 +192,8 @@ export async function fetchMachineData(
       }
     } else {
       // ── All-machines path (Dashboard) ────────────────────────────────────
-      // Collect distinct machine names from the main window results so we
-      // only fire anchor queries for machines that have data in this window.
       const machineNames = [...new Set(mainRecords.map((r) => r.machineName))];
 
-      // Fire all anchor queries in parallel — one per machine
       const anchorResults = await Promise.all(
         machineNames.map((name) =>
           supabase
@@ -183,7 +212,6 @@ export async function fetchMachineData(
         const anchorEndMs =
           new Date(anchor.timestamp).getTime() +
           (anchor.durationSeconds || 0) * 1000;
-        // Only prepend if this record actually overlaps into the window
         if (anchorEndMs > windowStartMs) {
           mainRecords.push(anchor);
         }
@@ -192,6 +220,43 @@ export async function fetchMachineData(
   }
 
   return mainRecords;
+}
+
+// ── fetchServerAnalytics ────────────────────────────────────────────────────
+/**
+ * Calls the Postgres RPC `get_machine_analytics` to compute running /
+ * downtime / off totals entirely in the database.
+ *
+ * This is the correct way to get analytics for wide date windows (week /
+ * month / 3-months) without transferring thousands of rows to the client.
+ *
+ * The RPC must exist in your Supabase project — run MIGRATION.sql first.
+ *
+ * Falls back gracefully to an empty array on error so callers can degrade.
+ */
+export async function fetchServerAnalytics(
+  from: string,
+  to: string,
+  machine?: string,
+): Promise<ServerAnalytics[]> {
+  const { data, error } = await supabase.rpc("get_machine_analytics", {
+    p_from: from,
+    p_to: to,
+    p_machine: machine ?? null,
+  });
+
+  if (error) {
+    console.error("fetchServerAnalytics RPC error:", error.message);
+    return [];
+  }
+
+  return (data ?? []).map((row: any) => ({
+    machineName: row.machine_name,
+    runningSeconds: Number(row.running_seconds ?? 0),
+    downtimeSeconds: Number(row.downtime_seconds ?? 0),
+    offSeconds: Number(row.off_seconds ?? 0),
+    totalRecords: Number(row.total_records ?? 0),
+  }));
 }
 
 // ── fetchDashboardOverview ─────────────────────────────────────────────────
@@ -204,18 +269,27 @@ export async function fetchDashboardOverview(): Promise<DashboardOverview[]> {
   if (!liveRows || liveRows.length === 0) return [];
 
   const machineNames = liveRows.map((r) => r.machine_name);
-  const { data: latestEvents, error: evErr } = await supabase
-    .from("machine_events")
-    .select("machine_name, shift, timestamp")
-    .in("machine_name", machineNames)
-    .order("timestamp", { ascending: false });
 
-  if (evErr)
-    throw new Error(`fetchDashboardOverview (events): ${evErr.message}`);
+  // FIX: was an unbounded scan of machine_events across all machines with no
+  // limit.  Now we fire one .limit(1) query per machine in parallel to fetch
+  // only the single latest event — same pattern as the anchor record logic.
+  const latestResults = await Promise.all(
+    machineNames.map((name) =>
+      supabase
+        .from("machine_events")
+        .select("machine_name, shift, timestamp")
+        .eq("machine_name", name)
+        .order("timestamp", { ascending: false })
+        .limit(1),
+    ),
+  );
 
   const latestMap: Record<string, any> = {};
-  for (const ev of latestEvents ?? []) {
-    if (!latestMap[ev.machine_name]) latestMap[ev.machine_name] = ev;
+  for (const { data: rows } of latestResults) {
+    if (rows && rows.length > 0) {
+      const ev = rows[0];
+      latestMap[ev.machine_name] = ev;
+    }
   }
 
   return liveRows.map((row) => ({
@@ -318,6 +392,10 @@ export async function fetchCollectorHealth(): Promise<CollectorHealth[]> {
 }
 
 // ── exportToCSV ────────────────────────────────────────────────────────────
+/**
+ * Exports all rows for the given window in CSV format.
+ * Uses a high limit only here — the user explicitly requested a download.
+ */
 export async function exportToCSV(filters?: {
   machine?: string;
   from?: string;
