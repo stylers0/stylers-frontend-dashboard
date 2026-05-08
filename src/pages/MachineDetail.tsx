@@ -1,7 +1,14 @@
 import { useEffect, useState, useMemo } from "react";
 import { useParams, Link } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { fetchMachineData, exportToCSV } from "@/lib/api";
+import {
+  fetchMachineData,
+  fetchServerAnalytics,
+  exportToCSV,
+  ServerAnalytics,
+  isLargeWindow,
+  DISPLAY_ROW_LIMIT,
+} from "@/lib/api";
 import { getWebSocketClient } from "@/lib/websocket";
 import {
   calculateMachineAnalytics,
@@ -81,6 +88,8 @@ export default function MachineDetail() {
     return filters;
   }, [timeFilter, customDateLabel]);
 
+  const largeWindow = isLargeWindow(dateRange.from, dateRange.to);
+
   // ── Fetch machine data ────────────────────────────────────────────────────
   const {
     data: machineData = [],
@@ -94,11 +103,21 @@ export default function MachineDetail() {
         machine: machineName,
         from: dateRange.from,
         to: dateRange.to,
-        limit: 99999,
+        // No explicit limit — api.ts applies DISPLAY_ROW_LIMIT automatically.
       }),
     enabled: !!machineName && !!dateRange.from && !!dateRange.to,
     refetchInterval: 60000,
     staleTime: 10000,
+  });
+
+  // For wide windows (week / month / 3-months) get accurate analytics totals
+  // from the database rather than summing the capped display rows.
+  const { data: serverAnalytics = [] } = useQuery<ServerAnalytics[]>({
+    queryKey: ["server-analytics", machineName, dateRange.from, dateRange.to],
+    queryFn: () =>
+      fetchServerAnalytics(dateRange.from, dateRange.to, machineName),
+    enabled: largeWindow && !!machineName && !!dateRange.from && !!dateRange.to,
+    staleTime: 30000,
   });
 
   // ── Clip to the REAL window start (not the buffered fetch start) ──────────
@@ -129,7 +148,32 @@ export default function MachineDetail() {
     return () => unsubscribe();
   }, [machineName, refetch]);
 
-  const analytics = calculateMachineAnalytics(displayData);
+  const analytics = useMemo(() => {
+    if (largeWindow && serverAnalytics.length > 0) {
+      const sa = serverAnalytics[0];
+      const total = sa.runningSeconds + sa.downtimeSeconds + sa.offSeconds;
+      const active = sa.runningSeconds + sa.downtimeSeconds;
+      return {
+        totalRecords: sa.totalRecords,
+        runningTime: sa.runningSeconds,
+        downtimeTime: sa.downtimeSeconds,
+        offTime: sa.offSeconds,
+        runningPercentage: total > 0 ? (sa.runningSeconds / total) * 100 : 0,
+        downtimePercentage: total > 0 ? (sa.downtimeSeconds / total) * 100 : 0,
+        offPercentage: total > 0 ? (sa.offSeconds / total) * 100 : 0,
+        utilizationPercentage:
+          active > 0 ? (sa.runningSeconds / active) * 100 : 0,
+        efficiencyPercentage:
+          active > 0 ? (sa.runningSeconds / active) * 100 : 0,
+        longestRunDuration: 0,
+        numberOfOffs: 0,
+        averageOffDuration: 0,
+        averageDowntimeDuration: 0,
+        statusCounts: { RUNNING: 0, DOWNTIME: 0, OFF: 0 },
+      };
+    }
+    return calculateMachineAnalytics(displayData);
+  }, [displayData, largeWindow, serverAnalytics]);
 
   const handleExport = async () => {
     if (!machineName) return;
@@ -203,6 +247,20 @@ export default function MachineDetail() {
           showResetButton={showResetButton}
           currentFilters={currentFilters}
         />
+
+        {/* Info banner for wide date windows */}
+        {largeWindow && (
+          <div className="flex items-start gap-3 rounded-lg border border-blue-200 bg-blue-50 dark:border-blue-800 dark:bg-blue-950/30 px-4 py-3 text-sm text-blue-800 dark:text-blue-300">
+            <span className="mt-0.5 shrink-0">ℹ️</span>
+            <span>
+              <strong>Wide date range selected.</strong> Analytics percentages
+              are calculated in the database for full accuracy. The timeline and
+              data log show the most recent{" "}
+              <strong>{DISPLAY_ROW_LIMIT.toLocaleString()}</strong> events — use{" "}
+              <em>Export CSV</em> to download the complete dataset.
+            </span>
+          </div>
+        )}
 
         <Tabs defaultValue="overview" className="space-y-6">
           <TabsList className="grid w-full max-w-md grid-cols-3">
